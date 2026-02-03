@@ -23,7 +23,7 @@ use crossterm::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse};
@@ -36,13 +36,15 @@ pub use overlay::{ApprovalOverlay, ApprovalRequest};
 /// TUI channel for interactive terminal input with Ratatui.
 pub struct TuiChannel {
     /// Channel for sending events to the TUI.
-    event_tx: Option<mpsc::Sender<AppEvent>>,
+    event_tx: Arc<Mutex<Option<mpsc::Sender<AppEvent>>>>,
 }
 
 impl TuiChannel {
     /// Create a new TUI channel.
     pub fn new() -> Self {
-        Self { event_tx: None }
+        Self {
+            event_tx: Arc::new(Mutex::new(None)),
+        }
     }
 }
 
@@ -62,20 +64,20 @@ impl Channel for TuiChannel {
         let (msg_tx, msg_rx) = mpsc::channel(32);
         let (event_tx, event_rx) = mpsc::channel(64);
 
-        // Store the event sender so we can send responses
-        // Note: In the actual implementation, we'd store this properly
-        // For now, spawn the TUI in a separate task
-        let event_tx_clone = event_tx.clone();
+        // Store the event sender for respond()
+        {
+            let mut guard = self.event_tx.lock().await;
+            *guard = Some(event_tx);
+        }
 
         tokio::task::spawn_blocking(move || {
             if let Err(e) = run_tui(msg_tx, event_rx) {
+                // Try to restore terminal even on error
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
                 tracing::error!("TUI error: {}", e);
             }
         });
-
-        // Keep the event_tx alive by storing it
-        // This is a hack; in production we'd use Arc<Mutex<>> or similar
-        let _ = event_tx_clone;
 
         Ok(Box::pin(ReceiverStream::new(msg_rx)))
     }
@@ -85,25 +87,32 @@ impl Channel for TuiChannel {
         _msg: &IncomingMessage,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
-        // Send response event to the TUI
-        if let Some(ref tx) = self.event_tx {
-            let _ = tx
-                .send(AppEvent::Response(response.content))
+        let guard = self.event_tx.lock().await;
+        if let Some(ref tx) = *guard {
+            tx.send(AppEvent::Response(response.content))
                 .await
                 .map_err(|e| ChannelError::SendFailed {
                     name: "tui".to_string(),
                     reason: e.to_string(),
-                });
+                })?;
         }
         Ok(())
     }
 
     async fn health_check(&self) -> Result<(), ChannelError> {
-        Ok(())
+        let guard = self.event_tx.lock().await;
+        if guard.is_some() {
+            Ok(())
+        } else {
+            Err(ChannelError::HealthCheckFailed {
+                name: "tui".to_string(),
+            })
+        }
     }
 
     async fn shutdown(&self) -> Result<(), ChannelError> {
-        if let Some(ref tx) = self.event_tx {
+        let guard = self.event_tx.lock().await;
+        if let Some(ref tx) = *guard {
             let _ = tx.send(AppEvent::Quit).await;
         }
         Ok(())
@@ -113,7 +122,7 @@ impl Channel for TuiChannel {
 /// Run the TUI event loop (blocking).
 fn run_tui(
     msg_tx: mpsc::Sender<IncomingMessage>,
-    mut event_rx: mpsc::Receiver<AppEvent>,
+    event_rx: mpsc::Receiver<AppEvent>,
 ) -> io::Result<()> {
     // Setup terminal
     enable_raw_mode()?;
@@ -126,7 +135,7 @@ fn run_tui(
     let mut app = AppState::new();
 
     // Run event loop
-    let result = events::run_event_loop(&mut terminal, &mut app, msg_tx, &mut event_rx);
+    let result = events::run_event_loop(&mut terminal, &mut app, msg_tx, event_rx);
 
     // Restore terminal
     disable_raw_mode()?;

@@ -75,10 +75,12 @@
 
 mod allowlist;
 mod capabilities;
+mod capabilities_schema;
 mod credential_injector;
 mod error;
 mod host;
 mod limits;
+mod loader;
 mod rate_limiter;
 mod runtime;
 mod storage;
@@ -111,3 +113,9 @@ pub use storage::{
     StoredWasmToolWithBinary, ToolStatus, TrustLevel, WasmStorageError, WasmToolStore,
     compute_binary_hash, verify_binary_integrity,
 };
+
+// Loader
+pub use loader::{DiscoveredTool, LoadResults, WasmLoadError, WasmToolLoader, discover_tools};
+
+// Capabilities schema (for parsing *.capabilities.json files)
+pub use capabilities_schema::CapabilitiesFile;

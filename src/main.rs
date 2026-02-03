@@ -7,7 +7,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 use near_agent::{
     agent::Agent,
-    channels::{ChannelManager, CliChannel, HttpChannel},
+    channels::{ChannelManager, HttpChannel, TuiChannel},
     config::Config,
     history::Store,
     llm::create_llm_provider,
@@ -79,10 +79,10 @@ async fn main() -> anyhow::Result<()> {
     // Initialize channel manager
     let mut channels = ChannelManager::new();
 
-    // Always add CLI channel
+    // Always add CLI channel (TUI with full-screen interface)
     if config.channels.cli.enabled {
-        channels.add(Box::new(CliChannel::new()));
-        tracing::info!("CLI channel enabled");
+        channels.add(Box::new(TuiChannel::new()));
+        tracing::info!("TUI channel enabled");
     }
 
     // Add HTTP channel if configured and not CLI-only mode

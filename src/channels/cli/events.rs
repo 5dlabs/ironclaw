@@ -20,7 +20,7 @@ pub fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut AppState,
     msg_tx: mpsc::Sender<IncomingMessage>,
-    event_rx: &mut mpsc::Receiver<AppEvent>,
+    mut event_rx: mpsc::Receiver<AppEvent>,
 ) -> io::Result<()> {
     loop {
         // Render
@@ -31,7 +31,7 @@ pub fn run_event_loop(
             return Ok(());
         }
 
-        // Poll for events
+        // Poll for terminal events
         if event::poll(TICK_RATE)? {
             let evt = event::read()?;
             if let Err(e) = handle_event(app, evt, &msg_tx) {
@@ -39,7 +39,7 @@ pub fn run_event_loop(
             }
         }
 
-        // Check for app events (non-blocking)
+        // Check for app events from agent (non-blocking)
         while let Ok(app_event) = event_rx.try_recv() {
             handle_app_event(app, app_event);
         }
