@@ -111,13 +111,13 @@ impl Channel for TuiChannel {
 
     async fn send_status(&self, status: StatusUpdate) -> Result<(), ChannelError> {
         let event = match status {
-            StatusUpdate::Thinking(msg) => AppEvent::LogMessage(format!("🤔 {}", msg)),
+            StatusUpdate::Thinking(msg) => AppEvent::ThinkingMessage(format!("🤔 {}", msg)),
             StatusUpdate::ToolStarted { name } => AppEvent::ToolStarted { name },
             StatusUpdate::ToolCompleted { name, success } => {
                 AppEvent::ToolCompleted { name, success }
             }
             StatusUpdate::StreamChunk(chunk) => AppEvent::StreamChunk(chunk),
-            StatusUpdate::Status(msg) => AppEvent::LogMessage(msg),
+            StatusUpdate::Status(msg) => AppEvent::ThinkingMessage(msg),
         };
         self.event_tx
             .send(event)

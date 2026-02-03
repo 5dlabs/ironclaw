@@ -118,16 +118,24 @@ impl LlmProvider for NearAiProvider {
 
         let response: NearAiResponse = self.send_request("responses", &request).await?;
 
+        tracing::debug!("NEAR AI response: {:?}", response);
+
         // Extract text from response output
         let text = response
             .output
             .iter()
             .filter_map(|item| {
+                tracing::debug!("Processing output item: type={}", item.item_type);
                 if item.item_type == "message" {
                     item.content.as_ref().and_then(|contents| {
                         contents
                             .iter()
                             .filter_map(|c| {
+                                tracing::debug!(
+                                    "Content item: type={}, text={:?}",
+                                    c.content_type,
+                                    c.text
+                                );
                                 if c.content_type == "output_text" {
                                     c.text.clone()
                                 } else {
@@ -142,6 +150,13 @@ impl LlmProvider for NearAiProvider {
             })
             .collect::<Vec<_>>()
             .join("");
+
+        if text.is_empty() {
+            tracing::warn!(
+                "Empty response from NEAR AI. Raw output: {:?}",
+                response.output
+            );
+        }
 
         Ok(CompletionResponse {
             content: text,

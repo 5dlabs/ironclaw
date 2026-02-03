@@ -258,13 +258,13 @@ fn handle_app_event(app: &mut AppState, event: AppEvent) {
             app.add_agent_message(content);
         }
         AppEvent::ToolStarted { name } => {
-            app.set_status(format!("Running tool: {}...", name));
+            app.set_thinking(format!("⚙️  Running tool: {}...", name));
         }
         AppEvent::ToolCompleted { name, success } => {
             if success {
-                app.set_status(format!("Tool {} completed", name));
+                app.set_thinking(format!("✓ Tool {} completed", name));
             } else {
-                app.set_status(format!("Tool {} failed", name));
+                app.set_thinking(format!("✗ Tool {} failed", name));
             }
         }
         AppEvent::ApprovalRequested(request) => {
@@ -287,6 +287,9 @@ fn handle_app_event(app: &mut AppState, event: AppEvent) {
         }
         AppEvent::LogMessage(msg) => {
             app.set_status(msg);
+        }
+        AppEvent::ThinkingMessage(msg) => {
+            app.set_thinking(msg);
         }
     }
 }

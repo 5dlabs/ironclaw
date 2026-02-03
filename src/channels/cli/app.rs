@@ -20,8 +20,10 @@ pub enum AppEvent {
     ApprovalRequested(ApprovalRequest),
     /// Streaming chunk received.
     StreamChunk(String),
-    /// Log message from the application.
+    /// Log message from the application (shown in status line).
     LogMessage(String),
+    /// Thinking/status message (shown in chat window).
+    ThinkingMessage(String),
     /// Force a redraw.
     Redraw,
     /// Quit the application.
@@ -153,8 +155,34 @@ impl AppState {
         if self.streaming_buffer.is_some() {
             self.streaming_buffer = None;
         }
+        // Remove any pending thinking message before adding the response
+        self.clear_thinking();
         self.messages.push(ChatMessage::agent(content));
         self.scroll_to_bottom();
+    }
+
+    /// Add or update a thinking/status message (shown as system message).
+    pub fn set_thinking(&mut self, content: impl Into<String>) {
+        let content = content.into();
+        // Check if last message is a thinking message (system with InProgress status)
+        if let Some(last) = self.messages.last_mut() {
+            if last.role == MessageRole::System && last.status == Some(MessageStatus::InProgress) {
+                last.content = content;
+                return;
+            }
+        }
+        // Add new thinking message
+        self.messages
+            .push(ChatMessage::system(content).with_status(MessageStatus::InProgress));
+        self.scroll_to_bottom();
+    }
+
+    /// Clear any thinking/status message.
+    pub fn clear_thinking(&mut self) {
+        // Remove any thinking messages (system with InProgress status)
+        self.messages.retain(|msg| {
+            !(msg.role == MessageRole::System && msg.status == Some(MessageStatus::InProgress))
+        });
     }
 
     /// Start streaming a response.
