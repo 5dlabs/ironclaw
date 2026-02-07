@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>IronClaw</title>
   <link rel="stylesheet" href="/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
   <!-- Auth Screen -->
@@ -38,14 +39,6 @@
       <div class="chat-container">
         <div class="chat-messages" id="chat-messages"></div>
         <div class="chat-status" id="chat-status"></div>
-        <div class="approval-banner" id="approval-banner">
-          <div class="approval-info" id="approval-info"></div>
-          <div class="approval-actions">
-            <button class="approve" onclick="sendApproval('yes')">Approve</button>
-            <button class="always" onclick="sendApproval('always')">Always</button>
-            <button class="deny" onclick="sendApproval('no')">Deny</button>
-          </div>
-        </div>
         <div class="chat-input">
           <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
           <button id="send-btn" onclick="sendMessage()">Send</button>

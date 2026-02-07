@@ -338,7 +338,6 @@ impl From<ChatMessage> for ChatCompletionMessage {
             Role::Tool => "tool",
         };
 
-        // Convert ToolCall -> ChatCompletionToolCall for assistant messages
         let tool_calls = msg.tool_calls.map(|calls| {
             calls
                 .into_iter()
@@ -353,9 +352,6 @@ impl From<ChatMessage> for ChatCompletionMessage {
                 .collect()
         });
 
-        // Per OpenAI protocol, assistant messages with tool_calls may have
-        // null/empty content. Only set content to None for assistant messages
-        // with tool_calls and empty content to match the API format.
         let content = if role == "assistant" && tool_calls.is_some() && msg.content.is_empty() {
             None
         } else {
@@ -452,5 +448,62 @@ mod tests {
         assert_eq!(chat_msg.role, "tool");
         assert_eq!(chat_msg.tool_call_id, Some("call_123".to_string()));
         assert_eq!(chat_msg.name, Some("my_tool".to_string()));
+    }
+
+    #[test]
+    fn test_assistant_with_tool_calls_conversion() {
+        use crate::llm::ToolCall;
+
+        let tool_calls = vec![
+            ToolCall {
+                id: "call_1".to_string(),
+                name: "list_issues".to_string(),
+                arguments: serde_json::json!({"owner": "foo", "repo": "bar"}),
+            },
+            ToolCall {
+                id: "call_2".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({"query": "test"}),
+            },
+        ];
+
+        let msg = ChatMessage::assistant_with_tool_calls(None, tool_calls);
+        let chat_msg: ChatCompletionMessage = msg.into();
+
+        assert_eq!(chat_msg.role, "assistant");
+
+        let tc = chat_msg.tool_calls.expect("tool_calls present");
+        assert_eq!(tc.len(), 2);
+        assert_eq!(tc[0].id, "call_1");
+        assert_eq!(tc[0].function.name, "list_issues");
+        assert_eq!(tc[0].call_type, "function");
+        assert_eq!(tc[1].id, "call_2");
+        assert_eq!(tc[1].function.name, "search");
+    }
+
+    #[test]
+    fn test_assistant_without_tool_calls_has_none() {
+        let msg = ChatMessage::assistant("Hello");
+        let chat_msg: ChatCompletionMessage = msg.into();
+        assert!(chat_msg.tool_calls.is_none());
+    }
+
+    #[test]
+    fn test_tool_call_arguments_serialized_to_string() {
+        use crate::llm::ToolCall;
+
+        let tc = ToolCall {
+            id: "call_1".to_string(),
+            name: "test".to_string(),
+            arguments: serde_json::json!({"key": "value"}),
+        };
+        let msg = ChatMessage::assistant_with_tool_calls(None, vec![tc]);
+        let chat_msg: ChatCompletionMessage = msg.into();
+
+        let calls = chat_msg.tool_calls.unwrap();
+        // Arguments should be a JSON string, not a nested object
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).expect("valid JSON string");
+        assert_eq!(parsed["key"], "value");
     }
 }

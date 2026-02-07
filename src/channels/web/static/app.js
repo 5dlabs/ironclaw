@@ -71,7 +71,6 @@ function connectSSE() {
     const data = JSON.parse(e.data);
     addMessage('assistant', data.content);
     setStatus('');
-    hideApproval();
   });
 
   eventSource.addEventListener('thinking', (e) => {
@@ -134,21 +133,47 @@ function sendMessage() {
   });
 }
 
-function sendApproval(response) {
-  apiFetch('/api/chat/send', {
+function sendApprovalAction(requestId, action) {
+  apiFetch('/api/chat/approval', {
     method: 'POST',
-    body: { content: response },
+    body: { request_id: requestId, action: action },
   }).catch((err) => {
     addMessage('system', 'Failed to send approval: ' + err.message);
   });
-  hideApproval();
+
+  // Disable buttons and show confirmation on the card
+  const card = document.querySelector('.approval-card[data-request-id="' + requestId + '"]');
+  if (card) {
+    const buttons = card.querySelectorAll('.approval-actions button');
+    buttons.forEach((btn) => {
+      btn.disabled = true;
+    });
+    const actions = card.querySelector('.approval-actions');
+    const label = document.createElement('span');
+    label.className = 'approval-resolved';
+    const labelText = action === 'approve' ? 'Approved' : action === 'always' ? 'Always approved' : 'Denied';
+    label.textContent = labelText;
+    actions.appendChild(label);
+  }
+}
+
+function renderMarkdown(text) {
+  if (typeof marked !== 'undefined') {
+    return marked.parse(text);
+  }
+  return escapeHtml(text);
 }
 
 function addMessage(role, content) {
   const container = document.getElementById('chat-messages');
   const div = document.createElement('div');
   div.className = 'message ' + role;
-  div.textContent = content;
+  if (role === 'user') {
+    div.textContent = content;
+  } else {
+    div.setAttribute('data-raw', content);
+    div.innerHTML = renderMarkdown(content);
+  }
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
 }
@@ -158,7 +183,9 @@ function appendToLastAssistant(chunk) {
   const messages = container.querySelectorAll('.message.assistant');
   if (messages.length > 0) {
     const last = messages[messages.length - 1];
-    last.textContent += chunk;
+    const raw = (last.getAttribute('data-raw') || '') + chunk;
+    last.setAttribute('data-raw', raw);
+    last.innerHTML = renderMarkdown(raw);
     container.scrollTop = container.scrollHeight;
   } else {
     addMessage('assistant', chunk);
@@ -175,14 +202,70 @@ function setStatus(text, spinning) {
 }
 
 function showApproval(data) {
-  const banner = document.getElementById('approval-banner');
-  const info = document.getElementById('approval-info');
-  info.textContent = 'Tool "' + data.tool_name + '" requires approval: ' + data.description;
-  banner.classList.add('visible');
-}
+  const container = document.getElementById('chat-messages');
+  const card = document.createElement('div');
+  card.className = 'approval-card';
+  card.setAttribute('data-request-id', data.request_id);
 
-function hideApproval() {
-  document.getElementById('approval-banner').classList.remove('visible');
+  const header = document.createElement('div');
+  header.className = 'approval-header';
+  header.textContent = 'Tool requires approval';
+  card.appendChild(header);
+
+  const toolName = document.createElement('div');
+  toolName.className = 'approval-tool-name';
+  toolName.textContent = data.tool_name;
+  card.appendChild(toolName);
+
+  if (data.description) {
+    const desc = document.createElement('div');
+    desc.className = 'approval-description';
+    desc.textContent = data.description;
+    card.appendChild(desc);
+  }
+
+  if (data.parameters) {
+    const paramsToggle = document.createElement('button');
+    paramsToggle.className = 'approval-params-toggle';
+    paramsToggle.textContent = 'Show parameters';
+    const paramsBlock = document.createElement('pre');
+    paramsBlock.className = 'approval-params';
+    paramsBlock.textContent = data.parameters;
+    paramsBlock.style.display = 'none';
+    paramsToggle.addEventListener('click', () => {
+      const visible = paramsBlock.style.display !== 'none';
+      paramsBlock.style.display = visible ? 'none' : 'block';
+      paramsToggle.textContent = visible ? 'Show parameters' : 'Hide parameters';
+    });
+    card.appendChild(paramsToggle);
+    card.appendChild(paramsBlock);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'approval-actions';
+
+  const approveBtn = document.createElement('button');
+  approveBtn.className = 'approve';
+  approveBtn.textContent = 'Approve';
+  approveBtn.addEventListener('click', () => sendApprovalAction(data.request_id, 'approve'));
+
+  const alwaysBtn = document.createElement('button');
+  alwaysBtn.className = 'always';
+  alwaysBtn.textContent = 'Always';
+  alwaysBtn.addEventListener('click', () => sendApprovalAction(data.request_id, 'always'));
+
+  const denyBtn = document.createElement('button');
+  denyBtn.className = 'deny';
+  denyBtn.textContent = 'Deny';
+  denyBtn.addEventListener('click', () => sendApprovalAction(data.request_id, 'deny'));
+
+  actions.appendChild(approveBtn);
+  actions.appendChild(alwaysBtn);
+  actions.appendChild(denyBtn);
+  card.appendChild(actions);
+
+  container.appendChild(card);
+  container.scrollTop = container.scrollHeight;
 }
 
 function loadHistory() {
@@ -454,6 +537,8 @@ function appendLogEntry(entry) {
   msg.textContent = entry.message;
   div.appendChild(msg);
 
+  div.addEventListener('click', () => div.classList.toggle('expanded'));
+
   // Apply current filters as visibility
   const matchesLevel = levelFilter === 'all' || entry.level === levelFilter;
   const matchesTarget = !targetFilter || entry.target.toLowerCase().includes(targetFilter);
@@ -574,6 +659,14 @@ function renderExtensionCard(ext) {
     card.appendChild(desc);
   }
 
+  if (ext.url) {
+    const url = document.createElement('div');
+    url.className = 'ext-url';
+    url.textContent = ext.url;
+    url.title = ext.url;
+    card.appendChild(url);
+  }
+
   if (ext.tools.length > 0) {
     const tools = document.createElement('div');
     tools.className = 'ext-tools';
@@ -610,7 +703,24 @@ function renderExtensionCard(ext) {
 function activateExtension(name) {
   apiFetch('/api/extensions/' + encodeURIComponent(name) + '/activate', { method: 'POST' })
     .then((res) => {
-      if (!res.success) {
+      if (res.success) {
+        loadExtensions();
+        return;
+      }
+
+      if (res.auth_url) {
+        addMessage(
+          'system',
+          'Opening authentication for **' + name + '**. Complete the flow in the opened tab, then click Activate again.'
+        );
+        window.open(res.auth_url, '_blank');
+      } else if (res.awaiting_token) {
+        addMessage(
+          'system',
+          (res.instructions || 'Please provide an API token for **' + name + '**.') +
+            '\n\nYou can authenticate via chat: type `Authenticate ' + name + '` and follow the instructions.'
+        );
+      } else {
         addMessage('system', 'Activate failed: ' + res.message);
       }
       loadExtensions();

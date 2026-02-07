@@ -121,6 +121,18 @@ pub enum ThreadState {
     Interrupted,
 }
 
+/// Pending auth token request.
+///
+/// When `tool_auth` returns `awaiting_token`, the thread enters auth mode.
+/// The next user message is intercepted before entering the normal pipeline
+/// (no logging, no turn creation, no history) and routed directly to the
+/// credential store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingAuth {
+    /// Extension name to authenticate.
+    pub extension_name: String,
+}
+
 /// Pending tool approval request stored on a thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingApproval {
@@ -158,6 +170,9 @@ pub struct Thread {
     /// Pending approval request (when state is AwaitingApproval).
     #[serde(default)]
     pub pending_approval: Option<PendingApproval>,
+    /// Pending auth token request (thread is in auth mode).
+    #[serde(default)]
+    pub pending_auth: Option<PendingAuth>,
 }
 
 impl Thread {
@@ -173,6 +188,7 @@ impl Thread {
             updated_at: now,
             metadata: serde_json::Value::Null,
             pending_approval: None,
+            pending_auth: None,
         }
     }
 
@@ -236,6 +252,18 @@ impl Thread {
         self.pending_approval = None;
         self.state = ThreadState::Idle;
         self.updated_at = Utc::now();
+    }
+
+    /// Enter auth mode: next user message will be routed directly to
+    /// the credential store, bypassing the normal pipeline entirely.
+    pub fn enter_auth_mode(&mut self, extension_name: String) {
+        self.pending_auth = Some(PendingAuth { extension_name });
+        self.updated_at = Utc::now();
+    }
+
+    /// Take the pending auth (clearing auth mode).
+    pub fn take_pending_auth(&mut self) -> Option<PendingAuth> {
+        self.pending_auth.take()
     }
 
     /// Interrupt the current turn.
@@ -510,5 +538,59 @@ mod tests {
         assert_eq!(thread.turns.len(), 2);
         assert_eq!(thread.turns[1].user_input, "How are you?");
         assert!(thread.turns[1].response.is_none());
+    }
+
+    #[test]
+    fn test_enter_auth_mode() {
+        let mut thread = Thread::new(Uuid::new_v4());
+        assert!(thread.pending_auth.is_none());
+
+        thread.enter_auth_mode("telegram".to_string());
+        assert!(thread.pending_auth.is_some());
+        assert_eq!(
+            thread.pending_auth.as_ref().unwrap().extension_name,
+            "telegram"
+        );
+    }
+
+    #[test]
+    fn test_take_pending_auth() {
+        let mut thread = Thread::new(Uuid::new_v4());
+        thread.enter_auth_mode("notion".to_string());
+
+        let pending = thread.take_pending_auth();
+        assert!(pending.is_some());
+        assert_eq!(pending.unwrap().extension_name, "notion");
+
+        // Should be cleared after take
+        assert!(thread.pending_auth.is_none());
+        assert!(thread.take_pending_auth().is_none());
+    }
+
+    #[test]
+    fn test_pending_auth_serialization() {
+        let mut thread = Thread::new(Uuid::new_v4());
+        thread.enter_auth_mode("openai".to_string());
+
+        let json = serde_json::to_string(&thread).expect("should serialize");
+        assert!(json.contains("pending_auth"));
+        assert!(json.contains("openai"));
+
+        let restored: Thread = serde_json::from_str(&json).expect("should deserialize");
+        assert!(restored.pending_auth.is_some());
+        assert_eq!(restored.pending_auth.unwrap().extension_name, "openai");
+    }
+
+    #[test]
+    fn test_pending_auth_default_none() {
+        // Deserialization of old data without pending_auth should default to None
+        let mut thread = Thread::new(Uuid::new_v4());
+        thread.pending_auth = None;
+        let json = serde_json::to_string(&thread).expect("serialize");
+
+        // Remove the pending_auth field to simulate old data
+        let json = json.replace(",\"pending_auth\":null", "");
+        let restored: Thread = serde_json::from_str(&json).expect("should deserialize");
+        assert!(restored.pending_auth.is_none());
     }
 }

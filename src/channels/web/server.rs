@@ -78,6 +78,7 @@ pub async fn start_server(
     let protected = Router::new()
         // Chat
         .route("/api/chat/send", post(chat_send_handler))
+        .route("/api/chat/approval", post(chat_approval_handler))
         .route("/api/chat/events", get(chat_events_handler))
         .route("/api/chat/history", get(chat_history_handler))
         .route("/api/chat/threads", get(chat_threads_handler))
@@ -180,6 +181,68 @@ async fn chat_send_handler(
         msg = msg.with_thread(thread_id);
     }
 
+    let msg_id = msg.id;
+
+    let tx_guard = state.msg_tx.read().await;
+    let tx = tx_guard.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Channel not started".to_string(),
+    ))?;
+
+    tx.send(msg).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Channel closed".to_string(),
+        )
+    })?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SendMessageResponse {
+            message_id: msg_id,
+            status: "accepted",
+        }),
+    ))
+}
+
+async fn chat_approval_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<ApprovalRequest>,
+) -> Result<(StatusCode, Json<SendMessageResponse>), (StatusCode, String)> {
+    let (approved, always) = match req.action.as_str() {
+        "approve" => (true, false),
+        "always" => (true, true),
+        "deny" => (false, false),
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Unknown action: {}", other),
+            ));
+        }
+    };
+
+    let request_id = Uuid::parse_str(&req.request_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid request_id (expected UUID)".to_string(),
+        )
+    })?;
+
+    // Build a structured ExecApproval submission as JSON, sent through the
+    // existing message pipeline so the agent loop picks it up.
+    let approval = crate::agent::submission::Submission::ExecApproval {
+        request_id,
+        approved,
+        always,
+    };
+    let content = serde_json::to_string(&approval).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to serialize approval: {}", e),
+        )
+    })?;
+
+    let msg = IncomingMessage::new("gateway", &state.user_id, content);
     let msg_id = msg.id;
 
     let tx_guard = state.msg_tx.read().await;
@@ -650,6 +713,7 @@ async fn extensions_list_handler(
             name: ext.name,
             kind: ext.kind.to_string(),
             description: ext.description,
+            url: ext.url,
             authenticated: ext.authenticated,
             active: ext.active,
             tools: ext.tools,
@@ -699,14 +763,8 @@ async fn extensions_install_handler(
         .install(&req.name, req.url.as_deref(), kind_hint)
         .await
     {
-        Ok(result) => Ok(Json(ActionResponse {
-            success: true,
-            message: result.message,
-        })),
-        Err(e) => Ok(Json(ActionResponse {
-            success: false,
-            message: e.to_string(),
-        })),
+        Ok(result) => Ok(Json(ActionResponse::ok(result.message))),
+        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
     }
 }
 
@@ -720,14 +778,45 @@ async fn extensions_activate_handler(
     ))?;
 
     match ext_mgr.activate(&name).await {
-        Ok(result) => Ok(Json(ActionResponse {
-            success: true,
-            message: result.message,
-        })),
-        Err(e) => Ok(Json(ActionResponse {
-            success: false,
-            message: e.to_string(),
-        })),
+        Ok(result) => Ok(Json(ActionResponse::ok(result.message))),
+        Err(activate_err) => {
+            let err_str = activate_err.to_string();
+            let needs_auth = err_str.contains("authentication")
+                || err_str.contains("401")
+                || err_str.contains("Unauthorized");
+
+            if !needs_auth {
+                return Ok(Json(ActionResponse::fail(err_str)));
+            }
+
+            // Activation failed due to auth; try authenticating first.
+            match ext_mgr.auth(&name, None).await {
+                Ok(auth_result) if auth_result.status == "authenticated" => {
+                    // Auth succeeded, retry activation.
+                    match ext_mgr.activate(&name).await {
+                        Ok(result) => Ok(Json(ActionResponse::ok(result.message))),
+                        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
+                    }
+                }
+                Ok(auth_result) => {
+                    // Auth in progress (OAuth URL or awaiting manual token).
+                    let mut resp = ActionResponse::fail(
+                        auth_result
+                            .instructions
+                            .clone()
+                            .unwrap_or_else(|| format!("'{}' requires authentication.", name)),
+                    );
+                    resp.auth_url = auth_result.auth_url;
+                    resp.awaiting_token = Some(auth_result.awaiting_token);
+                    resp.instructions = auth_result.instructions;
+                    Ok(Json(resp))
+                }
+                Err(auth_err) => Ok(Json(ActionResponse::fail(format!(
+                    "Authentication failed: {}",
+                    auth_err
+                )))),
+            }
+        }
     }
 }
 
@@ -741,13 +830,7 @@ async fn extensions_remove_handler(
     ))?;
 
     match ext_mgr.remove(&name).await {
-        Ok(message) => Ok(Json(ActionResponse {
-            success: true,
-            message,
-        })),
-        Err(e) => Ok(Json(ActionResponse {
-            success: false,
-            message: e.to_string(),
-        })),
+        Ok(message) => Ok(Json(ActionResponse::ok(message))),
+        Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
     }
 }

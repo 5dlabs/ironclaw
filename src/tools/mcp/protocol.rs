@@ -15,7 +15,12 @@ pub struct McpTool {
     pub description: String,
     /// JSON Schema for input parameters.
     /// Defaults to empty object schema if not provided.
-    #[serde(default = "default_input_schema")]
+    /// MCP protocol uses camelCase `inputSchema`.
+    #[serde(
+        default = "default_input_schema",
+        rename = "inputSchema",
+        alias = "input_schema"
+    )]
     pub input_schema: serde_json::Value,
     /// Optional annotations from the MCP server.
     #[serde(default)]
@@ -283,5 +288,97 @@ impl ContentBlock {
             Self::Text { text } => Some(text),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mcp_tool_deserialize_camel_case_input_schema() {
+        // MCP protocol uses camelCase "inputSchema"
+        let json = serde_json::json!({
+            "name": "list_issues",
+            "description": "List GitHub issues",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string" },
+                    "repo": { "type": "string" }
+                },
+                "required": ["owner", "repo"]
+            }
+        });
+
+        let tool: McpTool = serde_json::from_value(json).expect("deserialize McpTool");
+        assert_eq!(tool.name, "list_issues");
+        assert_eq!(tool.description, "List GitHub issues");
+
+        // The schema must have the properties, not the empty default
+        let props = tool.input_schema.get("properties").expect("has properties");
+        assert!(props.get("owner").is_some());
+        assert!(props.get("repo").is_some());
+    }
+
+    #[test]
+    fn test_mcp_tool_deserialize_snake_case_alias() {
+        // Also accept snake_case "input_schema" for flexibility
+        let json = serde_json::json!({
+            "name": "search",
+            "description": "Search",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" }
+                }
+            }
+        });
+
+        let tool: McpTool = serde_json::from_value(json).expect("deserialize McpTool");
+        let props = tool.input_schema.get("properties").expect("has properties");
+        assert!(props.get("query").is_some());
+    }
+
+    #[test]
+    fn test_mcp_tool_missing_schema_gets_default() {
+        let json = serde_json::json!({
+            "name": "ping",
+            "description": "Ping"
+        });
+
+        let tool: McpTool = serde_json::from_value(json).expect("deserialize McpTool");
+        assert_eq!(tool.input_schema["type"], "object");
+        assert!(tool.input_schema["properties"].is_object());
+    }
+
+    #[test]
+    fn test_mcp_tool_roundtrip_preserves_schema() {
+        // Simulate what list_tools returns from a real MCP server
+        let server_response = serde_json::json!({
+            "tools": [{
+                "name": "github-copilot_list_issues",
+                "description": "List issues for a repository",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "owner": { "type": "string", "description": "Repository owner" },
+                        "repo": { "type": "string", "description": "Repository name" },
+                        "state": { "type": "string", "enum": ["open", "closed", "all"] }
+                    },
+                    "required": ["owner", "repo"]
+                }
+            }]
+        });
+
+        let result: ListToolsResult =
+            serde_json::from_value(server_response).expect("deserialize ListToolsResult");
+        assert_eq!(result.tools.len(), 1);
+
+        let tool = &result.tools[0];
+        assert_eq!(tool.name, "github-copilot_list_issues");
+
+        let required = tool.input_schema.get("required").expect("has required");
+        assert!(required.as_array().expect("is array").len() == 2);
     }
 }

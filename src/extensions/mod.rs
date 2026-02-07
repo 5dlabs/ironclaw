@@ -176,6 +176,9 @@ pub struct InstalledExtension {
     pub kind: ExtensionKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Server or source URL (e.g. MCP server endpoint).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     pub authenticated: bool,
     pub active: bool,
     /// Tool names if active.

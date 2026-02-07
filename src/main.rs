@@ -8,10 +8,11 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use ironclaw::{
     agent::{Agent, AgentDeps, SessionManager},
     channels::{
-        AppEvent, ChannelManager, GatewayChannel, HttpChannel, ReplChannel, TuiChannel,
+        ChannelManager, GatewayChannel, HttpChannel, ReplChannel, WebhookServer,
+        WebhookServerConfig,
         wasm::{
             RegisteredEndpoint, SharedWasmChannel, WasmChannelLoader, WasmChannelRouter,
-            WasmChannelRuntime, WasmChannelRuntimeConfig, WasmChannelServer,
+            WasmChannelRuntime, WasmChannelRuntimeConfig, create_wasm_channel_router,
         },
         web::log_layer::{LogBroadcaster, WebLogLayer},
     },
@@ -43,7 +44,7 @@ use ironclaw::{
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Handle non-agent commands first (they don't need TUI/full setup)
+    // Handle non-agent commands first (they don't need full setup)
     match &cli.command {
         Some(Command::Tool(tool_cmd)) => {
             // Simple logging for CLI commands
@@ -218,8 +219,7 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    // Initialize session manager and authenticate BEFORE TUI setup
-    // This allows the auth menu to display cleanly without TUI interference
+    // Initialize session manager and authenticate before channel setup
     let session_config = SessionConfig {
         auth_base_url: config.llm.nearai.auth_base_url.clone(),
         session_path: config.llm.nearai.session_path.clone(),
@@ -228,10 +228,9 @@ async fn main() -> anyhow::Result<()> {
     let session = create_session_manager(session_config).await;
 
     // Ensure we're authenticated before proceeding (may trigger login flow)
-    // This happens before TUI so the menu displays correctly
     session.ensure_authenticated().await?;
 
-    // Initialize tracing and channels based on mode
+    // Initialize tracing
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("ironclaw=info,tower_http=debug"));
 
@@ -239,53 +238,19 @@ async fn main() -> anyhow::Result<()> {
     // This gets wired to the gateway's /api/logs/events SSE endpoint later.
     let log_broadcaster = Arc::new(LogBroadcaster::new());
 
-    // Determine which mode to use: REPL, single message, or TUI
-    let use_repl = cli.repl || cli.message.is_some();
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(WebLogLayer::new(Arc::clone(&log_broadcaster)))
+        .init();
 
-    // Create appropriate channel based on mode
-    let (tui_channel, tui_event_sender, repl_channel) = if use_repl {
-        // REPL mode - use simple stdin/stdout
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().with_target(false))
-            .with(WebLogLayer::new(Arc::clone(&log_broadcaster)))
-            .init();
-
-        let repl = if let Some(ref msg) = cli.message {
-            ReplChannel::with_message(msg.clone())
-        } else {
-            ReplChannel::new()
-        };
-
-        (None, None, Some(repl))
+    // Create CLI channel
+    let repl_channel = if let Some(ref msg) = cli.message {
+        Some(ReplChannel::with_message(msg.clone()))
     } else if config.channels.cli.enabled {
-        // TUI mode
-        let channel = TuiChannel::new();
-        let log_writer = channel.log_writer();
-        let event_sender = channel.event_sender();
-
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(log_writer)
-                    .without_time()
-                    .with_target(false)
-                    .with_level(true),
-            )
-            .with(WebLogLayer::new(Arc::clone(&log_broadcaster)))
-            .init();
-
-        (Some(channel), Some(event_sender), None)
+        Some(ReplChannel::new())
     } else {
-        // No CLI - just logging
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().with_target(false))
-            .with(WebLogLayer::new(Arc::clone(&log_broadcaster)))
-            .init();
-
-        (None, None, None)
+        None
     };
 
     tracing::info!("Starting IronClaw...");
@@ -306,34 +271,6 @@ async fn main() -> anyhow::Result<()> {
     // Initialize LLM provider (clone session so we can reuse it for embeddings)
     let llm = create_llm_provider(&config.llm, session.clone())?;
     tracing::info!("LLM provider initialized: {}", llm.model_name());
-
-    // Fetch available models and send to TUI (async, non-blocking)
-    if let Some(ref event_tx) = tui_event_sender {
-        let llm_for_models = llm.clone();
-        let event_tx = event_tx.clone();
-        tokio::spawn(async move {
-            match llm_for_models.list_models().await {
-                Ok(models) if !models.is_empty() => {
-                    let _ = event_tx.send(AppEvent::AvailableModels(models)).await;
-                }
-                Ok(_) => {
-                    let _ = event_tx
-                        .send(AppEvent::ErrorMessage(
-                            "No models available from API".into(),
-                        ))
-                        .await;
-                }
-                Err(e) => {
-                    let _ = event_tx
-                        .send(AppEvent::ErrorMessage(format!(
-                            "Failed to fetch models: {}",
-                            e
-                        )))
-                        .await;
-                }
-            }
-        });
-    }
 
     // Initialize safety layer
     let safety = Arc::new(SafetyLayer::new(&config.safety));
@@ -408,44 +345,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Builder mode enabled");
     }
 
-    // Load installed WASM tools (save runtime handle for extension manager)
-    let wasm_tool_runtime: Option<Arc<WasmToolRuntime>> = if config.wasm.enabled
-        && config.wasm.tools_dir.exists()
-    {
-        match WasmToolRuntime::new(config.wasm.to_runtime_config()) {
-            Ok(runtime) => {
-                let runtime = Arc::new(runtime);
-                let loader = WasmToolLoader::new(Arc::clone(&runtime), Arc::clone(&tools));
-
-                match loader.load_from_dir(&config.wasm.tools_dir).await {
-                    Ok(results) => {
-                        if !results.loaded.is_empty() {
-                            tracing::info!(
-                                "Loaded {} WASM tools from {}",
-                                results.loaded.len(),
-                                config.wasm.tools_dir.display()
-                            );
-                        }
-                        for (path, err) in &results.errors {
-                            tracing::warn!("Failed to load WASM tool {}: {}", path.display(), err);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to scan WASM tools directory: {}", e);
-                    }
-                }
-
-                Some(runtime)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to initialize WASM runtime: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     // Create secrets store if master key is configured (needed for MCP auth and WASM channels)
     let secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>> =
         if let (Some(store), Some(master_key)) = (&store, config.secrets.master_key()) {
@@ -463,91 +362,146 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-    // Load configured MCP servers
     let mcp_session_manager = Arc::new(McpSessionManager::new());
-    if let Some(ref secrets) = secrets_store {
-        match load_mcp_servers().await {
-            Ok(servers) => {
-                let enabled_count = servers.servers.iter().filter(|s| s.enabled).count();
-                if enabled_count > 0 {
-                    tracing::info!("Loading {} configured MCP server(s)...", enabled_count);
+
+    // Create WASM tool runtime (sync, just builds the wasmtime engine)
+    let wasm_tool_runtime: Option<Arc<WasmToolRuntime>> =
+        if config.wasm.enabled && config.wasm.tools_dir.exists() {
+            match WasmToolRuntime::new(config.wasm.to_runtime_config()) {
+                Ok(runtime) => Some(Arc::new(runtime)),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize WASM runtime: {}", e);
+                    None
                 }
+            }
+        } else {
+            None
+        };
 
-                for server in servers.enabled_servers() {
-                    tracing::debug!(
-                        "Checking authentication for MCP server '{}'...",
-                        server.name
-                    );
-                    // Check for stored tokens (from either pre-configured OAuth or DCR)
-                    let has_tokens = is_authenticated(server, secrets, "default").await;
-                    tracing::debug!("MCP server '{}' has_tokens={}", server.name, has_tokens);
+    // Load WASM tools and MCP servers concurrently.
+    // Both register into the shared ToolRegistry (RwLock-based) so concurrent writes are safe.
+    let wasm_tools_future = async {
+        if let Some(ref runtime) = wasm_tool_runtime {
+            let loader = WasmToolLoader::new(Arc::clone(runtime), Arc::clone(&tools));
+            match loader.load_from_dir(&config.wasm.tools_dir).await {
+                Ok(results) => {
+                    if !results.loaded.is_empty() {
+                        tracing::info!(
+                            "Loaded {} WASM tools from {}",
+                            results.loaded.len(),
+                            config.wasm.tools_dir.display()
+                        );
+                    }
+                    for (path, err) in &results.errors {
+                        tracing::warn!("Failed to load WASM tool {}: {}", path.display(), err);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to scan WASM tools directory: {}", e);
+                }
+            }
+        }
+    };
 
-                    let client = if has_tokens || server.requires_auth() {
-                        // Use authenticated client if we have tokens or OAuth is configured
-                        McpClient::new_authenticated(
-                            server.clone(),
-                            Arc::clone(&mcp_session_manager),
-                            Arc::clone(secrets),
-                            "default",
-                        )
-                    } else {
-                        // No tokens and no OAuth - try unauthenticated
-                        McpClient::new_with_name(&server.name, &server.url)
-                    };
+    let mcp_servers_future = async {
+        if let Some(ref secrets) = secrets_store {
+            match load_mcp_servers().await {
+                Ok(servers) => {
+                    let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
+                    if !enabled.is_empty() {
+                        tracing::info!("Loading {} configured MCP server(s)...", enabled.len());
+                    }
 
-                    tracing::debug!("Fetching tools from MCP server '{}'...", server.name);
-                    match client.list_tools().await {
-                        Ok(mcp_tools) => {
+                    let mut join_set = tokio::task::JoinSet::new();
+                    for server in enabled {
+                        let mcp_sm = Arc::clone(&mcp_session_manager);
+                        let secrets = Arc::clone(secrets);
+                        let tools = Arc::clone(&tools);
+
+                        join_set.spawn(async move {
+                            let server_name = server.name.clone();
                             tracing::debug!(
-                                "Got {} tools from MCP server '{}'",
-                                mcp_tools.len(),
-                                server.name
+                                "Checking authentication for MCP server '{}'...",
+                                server_name
                             );
-                            match client.create_tools().await {
-                                Ok(tool_impls) => {
-                                    for tool in tool_impls {
-                                        tools.register(tool).await;
-                                    }
-                                    tracing::info!(
-                                        "Loaded {} tools from MCP server '{}'",
-                                        mcp_tools.len(),
-                                        server.name
+                            let has_tokens = is_authenticated(&server, &secrets, "default").await;
+                            tracing::debug!(
+                                "MCP server '{}' has_tokens={}",
+                                server_name,
+                                has_tokens
+                            );
+
+                            let client = if has_tokens || server.requires_auth() {
+                                McpClient::new_authenticated(server, mcp_sm, secrets, "default")
+                            } else {
+                                McpClient::new_with_name(&server_name, &server.url)
+                            };
+
+                            tracing::debug!("Fetching tools from MCP server '{}'...", server_name);
+                            match client.list_tools().await {
+                                Ok(mcp_tools) => {
+                                    let tool_count = mcp_tools.len();
+                                    tracing::debug!(
+                                        "Got {} tools from MCP server '{}'",
+                                        tool_count,
+                                        server_name
                                     );
+                                    match client.create_tools().await {
+                                        Ok(tool_impls) => {
+                                            for tool in tool_impls {
+                                                tools.register(tool).await;
+                                            }
+                                            tracing::info!(
+                                                "Loaded {} tools from MCP server '{}'",
+                                                tool_count,
+                                                server_name
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to create tools from MCP server '{}': {}",
+                                                server_name,
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to create tools from MCP server '{}': {}",
-                                        server.name,
-                                        e
-                                    );
+                                    let err_str = e.to_string();
+                                    if err_str.contains("401") || err_str.contains("authentication")
+                                    {
+                                        tracing::warn!(
+                                            "MCP server '{}' requires authentication. \
+                                             Run: ironclaw mcp auth {}",
+                                            server_name,
+                                            server_name
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            "Failed to connect to MCP server '{}': {}",
+                                            server_name,
+                                            e
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            // Check if it's an auth error
-                            let err_str = e.to_string();
-                            if err_str.contains("401") || err_str.contains("authentication") {
-                                tracing::warn!(
-                                    "MCP server '{}' requires authentication. Run: ironclaw mcp auth {}",
-                                    server.name,
-                                    server.name
-                                );
-                            } else {
-                                tracing::warn!(
-                                    "Failed to connect to MCP server '{}': {}",
-                                    server.name,
-                                    e
-                                );
-                            }
+                        });
+                    }
+
+                    while let Some(result) = join_set.join_next().await {
+                        if let Err(e) = result {
+                            tracing::warn!("MCP server loading task panicked: {}", e);
                         }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::debug!("No MCP servers configured ({})", e);
+                Err(e) => {
+                    tracing::debug!("No MCP servers configured ({})", e);
+                }
             }
         }
-    }
+    };
+
+    tokio::join!(wasm_tools_future, mcp_servers_future);
 
     // Create extension manager for in-chat discovery/install/auth/activate
     let extension_manager = if let Some(ref secrets) = secrets_store {
@@ -620,7 +574,6 @@ async fn main() -> anyhow::Result<()> {
     // Initialize channel manager
     let mut channels = ChannelManager::new();
 
-    // Add REPL channel if in REPL mode
     if let Some(repl) = repl_channel {
         channels.add(Box::new(repl));
         if cli.message.is_some() {
@@ -629,25 +582,11 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("REPL mode enabled");
         }
     }
-    // Add TUI channel if CLI is enabled (already created for logging hookup)
-    else if let Some(tui) = tui_channel {
-        channels.add(Box::new(tui));
-        tracing::info!("TUI channel enabled");
-    }
 
-    // Add HTTP channel if configured and not CLI-only mode
-    if !cli.cli_only && !use_repl {
-        if let Some(ref http_config) = config.channels.http {
-            channels.add(Box::new(HttpChannel::new(http_config.clone())));
-            tracing::info!(
-                "HTTP channel enabled on {}:{}",
-                http_config.host,
-                http_config.port
-            );
-        }
-    }
+    // Collect webhook route fragments; a single WebhookServer hosts them all.
+    let mut webhook_routes: Vec<axum::Router> = Vec::new();
 
-    // Load WASM channels if enabled
+    // Load WASM channels and register their webhook routes.
     if config.channels.wasm_channels_enabled && config.channels.wasm_channels_dir.exists() {
         match WasmChannelRuntime::new(WasmChannelRuntimeConfig::default()) {
             Ok(runtime) => {
@@ -659,7 +598,6 @@ async fn main() -> anyhow::Result<()> {
                     .await
                 {
                     Ok(results) => {
-                        // Create router for WASM channel webhooks
                         let wasm_router = Arc::new(WasmChannelRouter::new());
                         let mut has_webhook_channels = false;
 
@@ -667,10 +605,8 @@ async fn main() -> anyhow::Result<()> {
                             let channel_name = loaded.name().to_string();
                             tracing::info!("Loaded WASM channel: {}", channel_name);
 
-                            // Get webhook secret name from capabilities (generic)
                             let secret_name = loaded.webhook_secret_name();
 
-                            // Get webhook secret for this channel from secrets store
                             let webhook_secret = if let Some(ref secrets) = secrets_store {
                                 secrets
                                     .get_decrypted("default", &secret_name)
@@ -681,12 +617,9 @@ async fn main() -> anyhow::Result<()> {
                                 None
                             };
 
-                            // Get the secret header name from capabilities
                             let secret_header =
                                 loaded.webhook_secret_header().map(|s| s.to_string());
 
-                            // Register channel with router for webhook handling
-                            // Use known webhook path based on channel name
                             let webhook_path = format!("/webhook/{}", channel_name);
                             let endpoints = vec![RegisteredEndpoint {
                                 channel_name: channel_name.clone(),
@@ -697,8 +630,6 @@ async fn main() -> anyhow::Result<()> {
 
                             let channel_arc = Arc::new(loaded.channel);
 
-                            // Inject runtime config into the channel (tunnel_url, webhook_secret)
-                            // This must be done before start() is called
                             {
                                 let mut config_updates = std::collections::HashMap::new();
 
@@ -744,7 +675,6 @@ async fn main() -> anyhow::Result<()> {
                                 .await;
                             has_webhook_channels = true;
 
-                            // Inject credentials for this channel (generic pattern-based injection)
                             if let Some(ref secrets) = secrets_store {
                                 match inject_channel_credentials(
                                     &channel_arc,
@@ -772,32 +702,14 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
 
-                            // Wrap in SharedWasmChannel for ChannelManager
-                            // Both the router and ChannelManager share the same underlying channel
                             channels.add(Box::new(SharedWasmChannel::new(channel_arc)));
                         }
 
-                        // Start WASM channel webhook server if we have channels with webhooks
                         if has_webhook_channels && config.tunnel.public_url.is_some() {
-                            let mut server = WasmChannelServer::new(wasm_router);
-                            if let Some(ref ext_mgr) = extension_manager {
-                                server = server.with_extension_manager(Arc::clone(ext_mgr));
-                            }
-                            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
-                            match server.start(addr).await {
-                                Ok(_handle) => {
-                                    tracing::info!(
-                                        "WASM channel webhook server started on {}",
-                                        addr
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to start WASM channel webhook server: {}",
-                                        e
-                                    );
-                                }
-                            }
+                            webhook_routes.push(create_wasm_channel_router(
+                                wasm_router,
+                                extension_manager.as_ref().map(Arc::clone),
+                            ));
                         }
 
                         for (path, err) in &results.errors {
@@ -818,6 +730,43 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Add HTTP channel if configured and not CLI-only mode.
+    // Extract its routes for the unified server; the channel itself just
+    // provides the mpsc stream.
+    let mut webhook_server_addr: Option<std::net::SocketAddr> = None;
+    if !cli.cli_only {
+        if let Some(ref http_config) = config.channels.http {
+            let http_channel = HttpChannel::new(http_config.clone());
+            webhook_routes.push(http_channel.routes());
+            let (host, port) = http_channel.addr();
+            webhook_server_addr = Some(
+                format!("{}:{}", host, port)
+                    .parse()
+                    .expect("HttpConfig host:port must be a valid SocketAddr"),
+            );
+            channels.add(Box::new(http_channel));
+            tracing::info!(
+                "HTTP channel enabled on {}:{}",
+                http_config.host,
+                http_config.port
+            );
+        }
+    }
+
+    // Start the unified webhook server if any routes were registered.
+    let mut webhook_server = if !webhook_routes.is_empty() {
+        let addr =
+            webhook_server_addr.unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 8080)));
+        let mut server = WebhookServer::new(WebhookServerConfig { addr });
+        for routes in webhook_routes {
+            server.add_routes(routes);
+        }
+        server.start().await?;
+        Some(server)
+    } else {
+        None
+    };
 
     // Create workspace for agent (shared with memory tools)
     let workspace = store.as_ref().map(|s| {
@@ -880,6 +829,7 @@ async fn main() -> anyhow::Result<()> {
         safety,
         tools,
         workspace,
+        extension_manager,
     };
     let agent = Agent::new(
         config.agent.clone(),
@@ -894,6 +844,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Run the agent (blocks until shutdown)
     agent.run().await?;
+
+    // Shut down the webhook server if one was started
+    if let Some(ref mut server) = webhook_server {
+        server.shutdown().await;
+    }
 
     tracing::info!("Agent shutdown complete");
     Ok(())

@@ -89,15 +89,32 @@ impl Default for LogBroadcaster {
     }
 }
 
-/// Visitor that extracts the `message` field from a tracing event.
+/// Visitor that extracts the `message` field and all extra key-value
+/// fields from a tracing event.
+///
+/// The terminal formatter shows something like:
+///   INFO ironclaw::agent: Request completed url="http://..." status=200
+///
+/// We replicate that by capturing both the message and the extra fields.
 struct MessageVisitor {
     message: String,
+    fields: Vec<String>,
 }
 
 impl MessageVisitor {
     fn new() -> Self {
         Self {
             message: String::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    /// Build the final message string: "message key=val key=val ..."
+    fn finish(self) -> String {
+        if self.fields.is_empty() {
+            self.message
+        } else {
+            format!("{} {}", self.message, self.fields.join(" "))
         }
     }
 }
@@ -110,12 +127,16 @@ impl Visit for MessageVisitor {
             if self.message.starts_with('"') && self.message.ends_with('"') {
                 self.message = self.message[1..self.message.len() - 1].to_string();
             }
+        } else {
+            self.fields.push(format!("{}={:?}", field.name(), value));
         }
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
             self.message = value.to_string();
+        } else {
+            self.fields.push(format!("{}={}", field.name(), value));
         }
     }
 }
@@ -153,7 +174,7 @@ impl<S: tracing::Subscriber> Layer<S> for WebLogLayer {
         let entry = LogEntry {
             level: metadata.level().to_string().to_uppercase(),
             target: metadata.target().to_string(),
-            message: visitor.message,
+            message: visitor.finish(),
             timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
 
@@ -260,5 +281,36 @@ mod tests {
         let recent = broadcaster.recent_entries();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].message, "before anyone listened");
+    }
+
+    #[test]
+    fn test_message_visitor_finish_message_only() {
+        let v = MessageVisitor {
+            message: "hello world".to_string(),
+            fields: vec![],
+        };
+        assert_eq!(v.finish(), "hello world");
+    }
+
+    #[test]
+    fn test_message_visitor_finish_with_fields() {
+        let v = MessageVisitor {
+            message: "Request completed".to_string(),
+            fields: vec![
+                "url=http://localhost:8080".to_string(),
+                "status=200".to_string(),
+            ],
+        };
+        let result = v.finish();
+        assert_eq!(
+            result,
+            "Request completed url=http://localhost:8080 status=200"
+        );
+    }
+
+    #[test]
+    fn test_message_visitor_finish_empty() {
+        let v = MessageVisitor::new();
+        assert_eq!(v.finish(), "");
     }
 }

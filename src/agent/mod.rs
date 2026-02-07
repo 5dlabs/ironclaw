@@ -30,7 +30,7 @@ pub use heartbeat::{HeartbeatConfig, HeartbeatResult, HeartbeatRunner, spawn_hea
 pub use router::{MessageIntent, Router};
 pub use scheduler::Scheduler;
 pub use self_repair::{BrokenTool, RepairResult, RepairTask, SelfRepair, StuckJob};
-pub use session::{PendingApproval, Session, Thread, ThreadState, Turn, TurnState};
+pub use session::{PendingApproval, PendingAuth, Session, Thread, ThreadState, Turn, TurnState};
 pub use session_manager::SessionManager;
 pub use submission::{Submission, SubmissionParser, SubmissionResult};
 pub use task::{Task, TaskContext, TaskHandler, TaskOutput, TaskStatus};

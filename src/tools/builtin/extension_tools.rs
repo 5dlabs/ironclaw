@@ -226,6 +226,38 @@ impl Tool for ToolAuthTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
+        // Auto-activate after successful auth so tools are available immediately
+        if result.status == "authenticated" {
+            match self.manager.activate(name).await {
+                Ok(activate_result) => {
+                    let output = serde_json::json!({
+                        "status": "authenticated_and_activated",
+                        "name": name,
+                        "tools_loaded": activate_result.tools_loaded,
+                        "message": activate_result.message,
+                    });
+                    return Ok(ToolOutput::success(output, start.elapsed()));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Extension '{}' authenticated but activation failed: {}",
+                        name,
+                        e
+                    );
+                    let output = serde_json::json!({
+                        "status": "authenticated",
+                        "name": name,
+                        "activation_error": e.to_string(),
+                        "message": format!(
+                            "Authenticated but activation failed: {}. Try tool_activate.",
+                            e
+                        ),
+                    });
+                    return Ok(ToolOutput::success(output, start.elapsed()));
+                }
+            }
+        }
+
         let output = serde_json::to_value(&result)
             .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
 

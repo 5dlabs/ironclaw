@@ -2,29 +2,6 @@
 
 use std::sync::Arc;
 
-/// Escape special characters for Telegram's legacy Markdown.
-///
-/// In Telegram's Markdown mode, these characters have special meaning:
-/// - `_` starts/ends italic
-/// - `*` starts/ends bold
-/// - `` ` `` starts/ends code
-/// - `[` starts a link
-///
-/// We escape them with backslash so dynamic content doesn't break formatting.
-fn escape_telegram_markdown(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '_' | '*' | '`' | '[' => {
-                result.push('\\');
-                result.push(c);
-            }
-            _ => result.push(c),
-        }
-    }
-    result
-}
-
 use futures::StreamExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -42,6 +19,7 @@ use crate::config::{AgentConfig, HeartbeatConfig};
 use crate::context::ContextManager;
 use crate::context::JobContext;
 use crate::error::Error;
+use crate::extensions::ExtensionManager;
 use crate::history::Store;
 use crate::llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult};
 use crate::safety::SafetyLayer;
@@ -68,6 +46,7 @@ pub struct AgentDeps {
     pub safety: Arc<SafetyLayer>,
     pub tools: Arc<ToolRegistry>,
     pub workspace: Option<Arc<Workspace>>,
+    pub extension_manager: Option<Arc<ExtensionManager>>,
 }
 
 /// The main agent that coordinates all components.
@@ -295,11 +274,19 @@ impl Agent {
                                     }
                                 }
                                 _ => {
-                                    // No target configured, just log
-                                    tracing::info!(
-                                        "Heartbeat notification (no target configured): {}",
-                                        &response.content
-                                    );
+                                    // No explicit target, broadcast to all channels
+                                    // for the default user so notifications actually
+                                    // reach someone instead of vanishing into logs.
+                                    let results = channels.broadcast_all("default", response).await;
+                                    for (ch, result) in results {
+                                        if let Err(e) = result {
+                                            tracing::warn!(
+                                                "Failed to broadcast heartbeat to {}: {}",
+                                                ch,
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -329,17 +316,37 @@ impl Agent {
         // Main message loop
         tracing::info!("Agent {} ready and listening", self.config.name);
 
-        while let Some(message) = message_stream.next().await {
+        loop {
+            let message = tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Ctrl+C received, shutting down...");
+                    break;
+                }
+                msg = message_stream.next() => {
+                    match msg {
+                        Some(m) => m,
+                        None => {
+                            tracing::info!("All channel streams ended, shutting down...");
+                            break;
+                        }
+                    }
+                }
+            };
+
             match self.handle_message(&message).await {
-                Ok(Some(response)) => {
+                Ok(Some(response)) if !response.is_empty() => {
                     let _ = self
                         .channels
                         .respond(&message, OutgoingResponse::text(response))
                         .await;
                 }
+                Ok(Some(_)) => {
+                    // Empty response, nothing to send (e.g. approval handled via send_status)
+                }
                 Ok(None) => {
-                    // Shutdown signal received
-                    tracing::info!("Shutdown signal received, exiting...");
+                    // Shutdown signal received (/quit, /exit, /shutdown)
+                    tracing::info!("Shutdown command received, exiting...");
                     break;
                 }
                 Err(e) => {
@@ -366,13 +373,6 @@ impl Agent {
     }
 
     async fn handle_message(&self, message: &IncomingMessage) -> Result<Option<String>, Error> {
-        tracing::debug!(
-            "Received message from {} on {}: {}",
-            message.user_id,
-            message.channel,
-            truncate(&message.content, 100)
-        );
-
         // Parse submission type first
         let submission = SubmissionParser::parse(&message.content);
 
@@ -385,6 +385,41 @@ impl Agent {
                 message.thread_id.as_deref(),
             )
             .await;
+
+        // Auth mode interception: if the thread is awaiting a token, route
+        // the message directly to the credential store. Nothing touches
+        // logs, turns, history, or compaction.
+        let pending_auth = {
+            let sess = session.lock().await;
+            sess.threads
+                .get(&thread_id)
+                .and_then(|t| t.pending_auth.clone())
+        };
+
+        if let Some(pending) = pending_auth {
+            match &submission {
+                Submission::UserInput { content } => {
+                    return self
+                        .process_auth_token(message, &pending, content, session, thread_id)
+                        .await;
+                }
+                _ => {
+                    // Any control submission (interrupt, undo, etc.) cancels auth mode
+                    let mut sess = session.lock().await;
+                    if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                        thread.pending_auth = None;
+                    }
+                    // Fall through to normal handling
+                }
+            }
+        }
+
+        tracing::debug!(
+            "Received message from {} on {} ({} chars)",
+            message.user_id,
+            message.channel,
+            message.content.len()
+        );
 
         // Process based on submission type
         let result = match submission {
@@ -401,6 +436,7 @@ impl Agent {
             Submission::Heartbeat => self.process_heartbeat().await,
             Submission::Summarize => self.process_summarize(session, thread_id).await,
             Submission::Suggest => self.process_suggest(session, thread_id).await,
+            Submission::Quit => return Ok(None),
             Submission::SwitchThread { thread_id: target } => {
                 self.process_switch_thread(message, target).await
             }
@@ -440,34 +476,24 @@ impl Agent {
                 description,
                 parameters,
             } => {
-                // Format approval request for user
-                let params_preview = serde_json::to_string_pretty(&parameters)
-                    .unwrap_or_else(|_| parameters.to_string());
-                let params_truncated = if params_preview.chars().count() > 200 {
-                    format!(
-                        "{}...",
-                        params_preview.chars().take(200).collect::<String>()
+                // Each channel renders the approval prompt via send_status.
+                // Web gateway shows an inline card, REPL prints a formatted prompt, etc.
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::ApprovalNeeded {
+                            request_id: request_id.to_string(),
+                            tool_name,
+                            description,
+                            parameters,
+                        },
+                        &message.metadata,
                     )
-                } else {
-                    params_preview
-                };
-                // Escape Markdown special chars in dynamic values to avoid breaking
-                // Telegram's Markdown parser (underscores, asterisks, backticks, brackets)
-                let tool_name_escaped = escape_telegram_markdown(&tool_name);
-                let description_escaped = escape_telegram_markdown(&description);
-                // Params go inside a code block, so no escaping needed there
-                Ok(Some(format!(
-                    "🔒 Tool requires approval:\n\n\
-                     *Tool:* {}\n\
-                     *Description:* {}\n\
-                     *Parameters:*\n```\n{}\n```\n\n\
-                     Reply with:\n\
-                     • yes or approve to allow this tool\n\
-                     • always to always allow this tool in this session\n\
-                     • no or deny to reject\n\n\
-                     Request ID: {}",
-                    tool_name_escaped, description_escaped, params_truncated, request_id
-                )))
+                    .await;
+
+                // Empty string signals the caller to skip respond() (no duplicate text)
+                Ok(Some(String::new()))
             }
         }
     }
@@ -625,7 +651,7 @@ impl Agent {
 
         // Run the agentic tool execution loop
         let result = self
-            .run_agentic_loop(message, session.clone(), thread_id, turn_messages)
+            .run_agentic_loop(message, session.clone(), thread_id, turn_messages, false)
             .await;
 
         // Re-acquire lock and check if interrupted
@@ -694,12 +720,17 @@ impl Agent {
     ///
     /// Returns `AgenticLoopResult::Response` on completion, or
     /// `AgenticLoopResult::NeedApproval` if a tool requires user approval.
+    ///
+    /// When `resume_after_tool` is true the loop already knows a tool was
+    /// executed earlier in this turn (e.g. an approved tool), so it won't
+    /// force the LLM to use tools if it responds with text.
     async fn run_agentic_loop(
         &self,
         message: &IncomingMessage,
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
         initial_messages: Vec<ChatMessage>,
+        resume_after_tool: bool,
     ) -> Result<AgenticLoopResult, Error> {
         // Load workspace system prompt (identity files: AGENTS.md, SOUL.md, etc.)
         let system_prompt = if let Some(ws) = self.workspace() {
@@ -728,7 +759,7 @@ impl Agent {
 
         const MAX_TOOL_ITERATIONS: usize = 10;
         let mut iteration = 0;
-        let mut tools_executed = false;
+        let mut tools_executed = resume_after_tool;
 
         loop {
             iteration += 1;
@@ -790,8 +821,8 @@ impl Agent {
                 } => {
                     tools_executed = true;
 
-                    // Add the assistant message WITH tool_calls to the context.
-                    // The OpenAI protocol requires this message before tool results.
+                    // Add the assistant message with tool_calls to context.
+                    // OpenAI protocol requires this before tool-result messages.
                     context_messages.push(ChatMessage::assistant_with_tool_calls(
                         content,
                         tool_calls.clone(),
@@ -868,6 +899,19 @@ impl Agent {
                                     }
                                 }
                             }
+                        }
+
+                        // If tool_auth returned awaiting_token, enter auth mode
+                        // and short-circuit: return the instructions directly so
+                        // the LLM doesn't get a chance to hallucinate tool calls.
+                        if let Some((ext_name, instructions)) =
+                            detect_auth_awaiting(&tc.name, &tool_result)
+                        {
+                            let mut sess = session.lock().await;
+                            if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                                thread.enter_auth_mode(ext_name);
+                            }
+                            return Ok(AgenticLoopResult::Response(instructions));
                         }
 
                         // Add tool result to context for next LLM call
@@ -1239,6 +1283,29 @@ impl Agent {
                 }
             }
 
+            // If tool_auth returned awaiting_token, enter auth mode and
+            // return instructions directly (skip agentic loop continuation).
+            if let Some((ext_name, instructions)) =
+                detect_auth_awaiting(&pending.tool_name, &tool_result)
+            {
+                {
+                    let mut sess = session.lock().await;
+                    if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                        thread.enter_auth_mode(ext_name);
+                        thread.complete_turn(&instructions);
+                    }
+                }
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::Status("Awaiting token".into()),
+                        &message.metadata,
+                    )
+                    .await;
+                return Ok(SubmissionResult::response(instructions));
+            }
+
             // Add tool result to context
             let result_content = match tool_result {
                 Ok(output) => {
@@ -1260,9 +1327,9 @@ impl Agent {
                 result_content,
             ));
 
-            // Continue the agentic loop
+            // Continue the agentic loop (a tool was already executed this turn)
             let result = self
-                .run_agentic_loop(message, session.clone(), thread_id, context_messages)
+                .run_agentic_loop(message, session.clone(), thread_id, context_messages, true)
                 .await;
 
             // Handle the result
@@ -1336,6 +1403,98 @@ impl Agent {
                  You can continue the conversation or try a different approach.",
                 pending.tool_name
             )))
+        }
+    }
+
+    /// Handle an auth token submitted while the thread is in auth mode.
+    ///
+    /// The token goes directly to the extension manager's credential store,
+    /// completely bypassing logging, turn creation, history, and compaction.
+    async fn process_auth_token(
+        &self,
+        message: &IncomingMessage,
+        pending: &crate::agent::session::PendingAuth,
+        token: &str,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+    ) -> Result<Option<String>, Error> {
+        let token = token.trim();
+
+        // Clear auth mode regardless of outcome
+        {
+            let mut sess = session.lock().await;
+            if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                thread.pending_auth = None;
+            }
+        }
+
+        let ext_mgr = match self.deps.extension_manager.as_ref() {
+            Some(mgr) => mgr,
+            None => return Ok(Some("Extension manager not available.".to_string())),
+        };
+
+        match ext_mgr.auth(&pending.extension_name, Some(token)).await {
+            Ok(result) if result.status == "authenticated" => {
+                tracing::info!(
+                    "Extension '{}' authenticated via auth mode",
+                    pending.extension_name
+                );
+
+                // Notify via channel status so the response doesn't echo the token
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::Status("Authenticated, loading tools...".into()),
+                        &message.metadata,
+                    )
+                    .await;
+
+                // Auto-activate so tools are available immediately after auth
+                match ext_mgr.activate(&pending.extension_name).await {
+                    Ok(activate_result) => {
+                        let tool_count = activate_result.tools_loaded.len();
+                        let tool_list = if activate_result.tools_loaded.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n\nTools: {}", activate_result.tools_loaded.join(", "))
+                        };
+                        Ok(Some(format!(
+                            "{} authenticated and activated ({} tools loaded).{}",
+                            pending.extension_name, tool_count, tool_list
+                        )))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Extension '{}' authenticated but activation failed: {}",
+                            pending.extension_name,
+                            e
+                        );
+                        Ok(Some(format!(
+                            "{} authenticated successfully, but activation failed: {}. \
+                             Try activating manually.",
+                            pending.extension_name, e
+                        )))
+                    }
+                }
+            }
+            Ok(result) => {
+                // Unexpected state, re-enter auth mode
+                {
+                    let mut sess = session.lock().await;
+                    if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                        thread.enter_auth_mode(pending.extension_name.clone());
+                    }
+                }
+                let msg = result
+                    .instructions
+                    .unwrap_or_else(|| "Invalid token. Please try again.".to_string());
+                Ok(Some(msg))
+            }
+            Err(e) => Ok(Some(format!(
+                "Authentication failed for {}: {}",
+                pending.extension_name, e
+            ))),
         }
     }
 
@@ -1730,20 +1889,101 @@ impl Agent {
                 Ok(Some(format!("Available tools: {}", tools.join(", "))))
             }
 
-            "quit" | "exit" | "shutdown" => {
-                // Signal shutdown - return None to indicate no response needed
-                Ok(None)
-            }
-
             _ => Ok(Some(format!("Unknown command: {}. Try /help", command))),
         }
     }
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len])
+/// Check if a tool_auth result indicates the extension is awaiting a token.
+///
+/// Returns `Some((extension_name, instructions))` if the tool result contains
+/// `awaiting_token: true`, meaning the thread should enter auth mode.
+fn detect_auth_awaiting(
+    tool_name: &str,
+    result: &Result<String, Error>,
+) -> Option<(String, String)> {
+    if tool_name != "tool_auth" {
+        return None;
+    }
+    let output = result.as_ref().ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(output).ok()?;
+    if parsed.get("awaiting_token") != Some(&serde_json::Value::Bool(true)) {
+        return None;
+    }
+    let name = parsed.get("name")?.as_str()?.to_string();
+    let instructions = parsed
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Please provide your API token/key.")
+        .to_string();
+    Some((name, instructions))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::Error;
+
+    use super::detect_auth_awaiting;
+
+    #[test]
+    fn test_detect_auth_awaiting_positive() {
+        let result: Result<String, Error> = Ok(serde_json::json!({
+            "name": "telegram",
+            "kind": "WasmTool",
+            "awaiting_token": true,
+            "status": "awaiting_token",
+            "instructions": "Please provide your Telegram Bot API token."
+        })
+        .to_string());
+
+        let detected = detect_auth_awaiting("tool_auth", &result);
+        assert!(detected.is_some());
+        let (name, instructions) = detected.unwrap();
+        assert_eq!(name, "telegram");
+        assert!(instructions.contains("Telegram Bot API"));
+    }
+
+    #[test]
+    fn test_detect_auth_awaiting_not_awaiting() {
+        let result: Result<String, Error> = Ok(serde_json::json!({
+            "name": "telegram",
+            "kind": "WasmTool",
+            "awaiting_token": false,
+            "status": "authenticated"
+        })
+        .to_string());
+
+        assert!(detect_auth_awaiting("tool_auth", &result).is_none());
+    }
+
+    #[test]
+    fn test_detect_auth_awaiting_wrong_tool() {
+        let result: Result<String, Error> = Ok(serde_json::json!({
+            "name": "telegram",
+            "awaiting_token": true,
+        })
+        .to_string());
+
+        assert!(detect_auth_awaiting("tool_list", &result).is_none());
+    }
+
+    #[test]
+    fn test_detect_auth_awaiting_error_result() {
+        let result: Result<String, Error> =
+            Err(crate::error::ToolError::NotFound { name: "x".into() }.into());
+        assert!(detect_auth_awaiting("tool_auth", &result).is_none());
+    }
+
+    #[test]
+    fn test_detect_auth_awaiting_default_instructions() {
+        let result: Result<String, Error> = Ok(serde_json::json!({
+            "name": "custom_tool",
+            "awaiting_token": true,
+            "status": "awaiting_token"
+        })
+        .to_string());
+
+        let (_, instructions) = detect_auth_awaiting("tool_auth", &result).unwrap();
+        assert_eq!(instructions, "Please provide your API token/key.");
     }
 }

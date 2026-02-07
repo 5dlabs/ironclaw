@@ -56,6 +56,15 @@ pub struct HistoryResponse {
     pub turns: Vec<TurnInfo>,
 }
 
+// --- Approval ---
+
+#[derive(Debug, Deserialize)]
+pub struct ApprovalRequest {
+    pub request_id: String,
+    /// "approve", "always", or "deny"
+    pub action: String,
+}
+
 // --- SSE Event Types ---
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,6 +193,8 @@ pub struct ExtensionInfo {
     pub name: String,
     pub kind: String,
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     pub authenticated: bool,
     pub active: bool,
     pub tools: Vec<String>,
@@ -216,6 +227,37 @@ pub struct InstallExtensionRequest {
 pub struct ActionResponse {
     pub success: bool,
     pub message: String,
+    /// Auth URL to open (when activation requires OAuth).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<String>,
+    /// Whether the extension is waiting for a manual token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub awaiting_token: Option<bool>,
+    /// Instructions for manual token entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+impl ActionResponse {
+    pub fn ok(message: impl Into<String>) -> Self {
+        Self {
+            success: true,
+            message: message.into(),
+            auth_url: None,
+            awaiting_token: None,
+            instructions: None,
+        }
+    }
+
+    pub fn fail(message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            message: message.into(),
+            auth_url: None,
+            awaiting_token: None,
+            instructions: None,
+        }
+    }
 }
 
 // --- Health ---

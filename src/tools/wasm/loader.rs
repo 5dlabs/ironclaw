@@ -165,17 +165,18 @@ impl WasmToolLoader {
         }
 
         let mut results = LoadResults::default();
+
+        // Collect all .wasm entries first, then load in parallel
+        let mut tool_entries = Vec::new();
         let mut entries = fs::read_dir(dir).await?;
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
 
-            // Only process .wasm files
             if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
                 continue;
             }
 
-            // Extract tool name from filename
             let name = match path.file_stem().and_then(|s| s.to_str()) {
                 Some(n) => n.to_string(),
                 None => {
@@ -187,15 +188,20 @@ impl WasmToolLoader {
                 }
             };
 
-            // Look for sidecar capabilities file
             let cap_path = path.with_extension("capabilities.json");
-            let cap_path_option = if cap_path.exists() {
-                Some(cap_path.as_path())
-            } else {
-                None
-            };
+            let has_cap = cap_path.exists();
+            tool_entries.push((name, path, if has_cap { Some(cap_path) } else { None }));
+        }
 
-            match self.load_from_files(&name, &path, cap_path_option).await {
+        // Load all tools in parallel (file I/O + WASM compilation + registration)
+        let load_futures = tool_entries
+            .iter()
+            .map(|(name, path, cap_path)| self.load_from_files(name, path, cap_path.as_deref()));
+
+        let load_results = futures::future::join_all(load_futures).await;
+
+        for ((name, path, _), result) in tool_entries.into_iter().zip(load_results) {
+            match result {
                 Ok(()) => {
                     results.loaded.push(name);
                 }

@@ -205,6 +205,18 @@ impl Channel for GatewayChannel {
             }
             StatusUpdate::StreamChunk(content) => SseEvent::StreamChunk { content },
             StatusUpdate::Status(msg) => SseEvent::Status { message: msg },
+            StatusUpdate::ApprovalNeeded {
+                request_id,
+                tool_name,
+                description,
+                parameters,
+            } => SseEvent::ApprovalNeeded {
+                request_id,
+                tool_name,
+                description,
+                parameters: serde_json::to_string_pretty(&parameters)
+                    .unwrap_or_else(|_| parameters.to_string()),
+            },
         };
 
         self.state.sse.broadcast(event);

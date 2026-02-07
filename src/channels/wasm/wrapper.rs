@@ -1844,6 +1844,15 @@ fn status_to_wit(status: &StatusUpdate, metadata: &serde_json::Value) -> wit_cha
                 metadata_json,
             }
         }
+        StatusUpdate::ApprovalNeeded {
+            tool_name,
+            description,
+            ..
+        } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Thinking,
+            message: format!("Approval needed: {} - {}", tool_name, description),
+            metadata_json,
+        },
     }
 }
 

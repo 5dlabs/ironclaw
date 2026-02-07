@@ -43,6 +43,9 @@ impl SubmissionParser {
         if lower == "/thread new" || lower == "/new" {
             return Submission::NewThread;
         }
+        if lower == "/quit" || lower == "/exit" || lower == "/shutdown" {
+            return Submission::Quit;
+        }
 
         // /thread <uuid> - switch thread
         if let Some(rest) = lower.strip_prefix("/thread ") {
@@ -58,6 +61,15 @@ impl SubmissionParser {
         if let Some(rest) = lower.strip_prefix("/resume ") {
             if let Ok(id) = Uuid::parse_str(rest.trim()) {
                 return Submission::Resume { checkpoint_id: id };
+            }
+        }
+
+        // Try structured JSON approval (from web gateway's /api/chat/approval endpoint)
+        if trimmed.starts_with('{') {
+            if let Ok(submission) = serde_json::from_str::<Submission>(trimmed) {
+                if matches!(submission, Submission::ExecApproval { .. }) {
+                    return submission;
+                }
             }
         }
 
@@ -157,6 +169,9 @@ pub enum Submission {
 
     /// Suggest next steps based on the current thread.
     Suggest,
+
+    /// Quit the agent. Bypasses thread-state checks.
+    Quit,
 }
 
 impl Submission {
@@ -406,5 +421,98 @@ mod tests {
         // Unknown command should become user input
         let submission = SubmissionParser::parse("/unknown");
         assert!(matches!(submission, Submission::UserInput { content } if content == "/unknown"));
+    }
+
+    #[test]
+    fn test_parser_json_exec_approval() {
+        let req_id = Uuid::new_v4();
+        let json = serde_json::to_string(&Submission::ExecApproval {
+            request_id: req_id,
+            approved: true,
+            always: false,
+        })
+        .expect("serialize");
+
+        let submission = SubmissionParser::parse(&json);
+        assert!(
+            matches!(submission, Submission::ExecApproval { request_id, approved, always }
+                if request_id == req_id && approved && !always)
+        );
+    }
+
+    #[test]
+    fn test_parser_json_exec_approval_always() {
+        let req_id = Uuid::new_v4();
+        let json = serde_json::to_string(&Submission::ExecApproval {
+            request_id: req_id,
+            approved: true,
+            always: true,
+        })
+        .expect("serialize");
+
+        let submission = SubmissionParser::parse(&json);
+        assert!(
+            matches!(submission, Submission::ExecApproval { request_id, approved, always }
+                if request_id == req_id && approved && always)
+        );
+    }
+
+    #[test]
+    fn test_parser_json_exec_approval_deny() {
+        let req_id = Uuid::new_v4();
+        let json = serde_json::to_string(&Submission::ExecApproval {
+            request_id: req_id,
+            approved: false,
+            always: false,
+        })
+        .expect("serialize");
+
+        let submission = SubmissionParser::parse(&json);
+        assert!(
+            matches!(submission, Submission::ExecApproval { request_id, approved, always }
+                if request_id == req_id && !approved && !always)
+        );
+    }
+
+    #[test]
+    fn test_parser_json_non_approval_stays_user_input() {
+        // A JSON UserInput should NOT be intercepted, it should be treated as text
+        let json = r#"{"UserInput":{"content":"hello"}}"#;
+        let submission = SubmissionParser::parse(json);
+        assert!(matches!(submission, Submission::UserInput { .. }));
+    }
+
+    #[test]
+    fn test_parser_json_roundtrip_matches_approval_handler() {
+        // Simulate exactly what chat_approval_handler does: serialize a Submission::ExecApproval
+        // and verify the parser picks it up correctly.
+        let request_id = Uuid::new_v4();
+        let approval = Submission::ExecApproval {
+            request_id,
+            approved: true,
+            always: false,
+        };
+        let json = serde_json::to_string(&approval).expect("serialize");
+        eprintln!("Serialized approval JSON: {}", json);
+
+        let parsed = SubmissionParser::parse(&json);
+        assert!(
+            matches!(parsed, Submission::ExecApproval { request_id: rid, approved, always }
+                if rid == request_id && approved && !always),
+            "Expected ExecApproval, got {:?}",
+            parsed
+        );
+    }
+
+    #[test]
+    fn test_parser_quit() {
+        assert!(matches!(SubmissionParser::parse("/quit"), Submission::Quit));
+        assert!(matches!(SubmissionParser::parse("/exit"), Submission::Quit));
+        assert!(matches!(
+            SubmissionParser::parse("/shutdown"),
+            Submission::Quit
+        ));
+        assert!(matches!(SubmissionParser::parse("/QUIT"), Submission::Quit));
+        assert!(matches!(SubmissionParser::parse("/Exit"), Submission::Quit));
     }
 }

@@ -112,6 +112,13 @@ pub enum StatusUpdate {
     StreamChunk(String),
     /// General status message.
     Status(String),
+    /// Tool requires user approval before execution.
+    ApprovalNeeded {
+        request_id: String,
+        tool_name: String,
+        description: String,
+        parameters: serde_json::Value,
+    },
 }
 
 /// Trait for message channels.
