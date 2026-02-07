@@ -21,6 +21,7 @@ use crate::llm::provider::{
 pub struct NearAiChatProvider {
     client: Client,
     config: NearAiConfig,
+    active_model: std::sync::RwLock<String>,
 }
 
 impl NearAiChatProvider {
@@ -37,7 +38,12 @@ impl NearAiChatProvider {
             .build()
             .unwrap_or_else(|_| Client::new());
 
-        Ok(Self { client, config })
+        let active_model = std::sync::RwLock::new(config.model.clone());
+        Ok(Self {
+            client,
+            config,
+            active_model,
+        })
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -171,7 +177,7 @@ impl LlmProvider for NearAiChatProvider {
             req.messages.into_iter().map(|m| m.into()).collect();
 
         let request = ChatCompletionRequest {
-            model: self.config.model.clone(),
+            model: self.active_model_name(),
             messages,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
@@ -229,7 +235,7 @@ impl LlmProvider for NearAiChatProvider {
             .collect();
 
         let request = ChatCompletionRequest {
-            model: self.config.model.clone(),
+            model: self.active_model_name(),
             messages,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
@@ -304,12 +310,29 @@ impl LlmProvider for NearAiChatProvider {
     }
 
     async fn model_metadata(&self) -> Result<ModelMetadata, LlmError> {
+        let active = self.active_model_name();
         let models = self.fetch_models().await?;
-        let current = models.iter().find(|m| m.id == self.config.model);
+        let current = models.iter().find(|m| m.id == active);
         Ok(ModelMetadata {
-            id: self.config.model.clone(),
+            id: active,
             context_length: current.and_then(|m| m.context_length),
         })
+    }
+
+    fn active_model_name(&self) -> String {
+        self.active_model
+            .read()
+            .expect("active_model lock poisoned")
+            .clone()
+    }
+
+    fn set_model(&self, model: &str) -> Result<(), crate::error::LlmError> {
+        let mut guard = self
+            .active_model
+            .write()
+            .expect("active_model lock poisoned");
+        *guard = model.to_string();
+        Ok(())
     }
 }
 

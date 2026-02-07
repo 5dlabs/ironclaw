@@ -273,6 +273,22 @@ pub trait LlmProvider: Send + Sync {
         })
     }
 
+    /// Get the currently active model name.
+    ///
+    /// May differ from `model_name()` if the model was switched at runtime
+    /// via `set_model()`. Default returns `model_name()`.
+    fn active_model_name(&self) -> String {
+        self.model_name().to_string()
+    }
+
+    /// Switch the active model at runtime. Not all providers support this.
+    fn set_model(&self, _model: &str) -> Result<(), LlmError> {
+        Err(LlmError::RequestFailed {
+            provider: "unknown".to_string(),
+            reason: "Runtime model switching not supported by this provider".to_string(),
+        })
+    }
+
     /// Calculate cost for a completion.
     fn calculate_cost(&self, input_tokens: u32, output_tokens: u32) -> Decimal {
         let (input_cost, output_cost) = self.cost_per_token();
