@@ -78,6 +78,8 @@ pub enum SseEvent {
     ToolStarted { name: String },
     #[serde(rename = "tool_completed")]
     ToolCompleted { name: String, success: bool },
+    #[serde(rename = "tool_result")]
+    ToolResult { name: String, preview: String },
     #[serde(rename = "stream_chunk")]
     StreamChunk { content: String },
     #[serde(rename = "status")]
@@ -444,6 +446,7 @@ impl WsServerMessage {
             SseEvent::Thinking { .. } => "thinking",
             SseEvent::ToolStarted { .. } => "tool_started",
             SseEvent::ToolCompleted { .. } => "tool_completed",
+            SseEvent::ToolResult { .. } => "tool_result",
             SseEvent::StreamChunk { .. } => "stream_chunk",
             SseEvent::Status { .. } => "status",
             SseEvent::JobStarted { .. } => "job_started",
