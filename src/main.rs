@@ -876,8 +876,8 @@ async fn main() -> anyhow::Result<()> {
     // Create session manager (shared between agent and web gateway)
     let session_manager = Arc::new(SessionManager::new());
 
-    // Register job tools
-    tools.register_job_tools(Arc::clone(&context_manager));
+    // Register job tools (skip create_job when sandbox is enabled to avoid duplicates)
+    tools.register_job_tools(Arc::clone(&context_manager), config.sandbox.enabled);
 
     // Add web gateway channel if configured
     if let Some(ref gw_config) = config.channels.gateway {

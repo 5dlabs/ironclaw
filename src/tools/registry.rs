@@ -187,13 +187,23 @@ impl ToolRegistry {
     ///
     /// Job tools allow the LLM to create, list, check status, and cancel jobs.
     /// These enable natural language job management without hardcoded intent parsing.
-    pub fn register_job_tools(&self, context_manager: Arc<ContextManager>) {
-        self.register_sync(Arc::new(CreateJobTool::new(Arc::clone(&context_manager))));
+    ///
+    /// When `sandbox_enabled` is true, `create_job` is skipped because
+    /// `run_in_sandbox` already creates tracked sandbox jobs. Registering both
+    /// causes duplicates: the LLM calls `create_job` (pending placeholder) then
+    /// `run_in_sandbox` (actual execution), producing two entries in the jobs list.
+    pub fn register_job_tools(&self, context_manager: Arc<ContextManager>, sandbox_enabled: bool) {
+        let mut count = 0;
+        if !sandbox_enabled {
+            self.register_sync(Arc::new(CreateJobTool::new(Arc::clone(&context_manager))));
+            count += 1;
+        }
         self.register_sync(Arc::new(ListJobsTool::new(Arc::clone(&context_manager))));
         self.register_sync(Arc::new(JobStatusTool::new(Arc::clone(&context_manager))));
         self.register_sync(Arc::new(CancelJobTool::new(context_manager)));
+        count += 3;
 
-        tracing::info!("Registered 4 job management tools");
+        tracing::info!("Registered {} job management tools", count);
     }
 
     /// Register extension management tools (search, install, auth, activate, list, remove).

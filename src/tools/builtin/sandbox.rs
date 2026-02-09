@@ -112,11 +112,13 @@ impl Tool for RunInSandboxTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a task in a sandboxed Docker container. The container has its own \
-         sub-agent with shell, file read/write, list_dir, and apply_patch tools. \
-         Use this for any work that requires filesystem access or shell commands. \
-         The task description should be clear enough for the sub-agent to work independently. \
-         Set mode to 'claude_code' for complex software engineering tasks (uses Claude Code CLI)."
+        "Execute a task in a sandboxed Docker container. This is the primary way to create \
+         and run jobs. The container has its own sub-agent with shell, file read/write, \
+         list_dir, and apply_patch tools. Use this whenever the user asks you to build, \
+         create, or work on something. The task description should be detailed enough for \
+         the sub-agent to work independently. Set wait=false to start immediately while \
+         continuing the conversation. Set mode to 'claude_code' for complex software \
+         engineering tasks (uses Claude Code CLI)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
