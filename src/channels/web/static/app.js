@@ -4,6 +4,7 @@ let token = '';
 let eventSource = null;
 let logEventSource = null;
 let currentTab = 'chat';
+let claudeCodeEvents = new Map(); // job_id -> Array of events
 
 // --- Auth ---
 
@@ -126,6 +127,23 @@ function connectSSE() {
       addMessage('system', 'Error: ' + data.message);
     }
   });
+
+  // Claude Code event listeners
+  const ccEventTypes = [
+    'claude_code_message', 'claude_code_tool_use', 'claude_code_tool_result',
+    'claude_code_status', 'claude_code_result'
+  ];
+  for (const evtType of ccEventTypes) {
+    eventSource.addEventListener(evtType, (e) => {
+      const data = JSON.parse(e.data);
+      const jobId = data.job_id;
+      if (!jobId) return;
+      if (!claudeCodeEvents.has(jobId)) claudeCodeEvents.set(jobId, []);
+      claudeCodeEvents.get(jobId).push({ type: evtType, data: data, ts: Date.now() });
+      // If the Claude Code tab is currently visible for this job, refresh it
+      refreshClaudeCodeTab(jobId);
+    });
+  }
 }
 
 // --- Chat ---
@@ -1093,9 +1111,13 @@ function renderJobDetail(job) {
   const tabs = document.createElement('div');
   tabs.className = 'job-detail-tabs';
   const subtabs = ['overview', 'actions', 'thinking', 'files'];
+  // Show Claude Code tab for claude_code mode jobs (check job_mode field from backend)
+  if (job && job.job_mode === 'claude_code') {
+    subtabs.push('claude_code');
+  }
   for (const st of subtabs) {
     const btn = document.createElement('button');
-    btn.textContent = st.charAt(0).toUpperCase() + st.slice(1);
+    btn.textContent = st === 'claude_code' ? 'Claude Code' : st.charAt(0).toUpperCase() + st.slice(1);
     btn.className = st === currentJobSubTab ? 'active' : '';
     btn.addEventListener('click', () => {
       currentJobSubTab = st;
@@ -1115,6 +1137,7 @@ function renderJobDetail(job) {
     case 'actions': renderJobActions(content, job); break;
     case 'thinking': renderJobConversation(content, job); break;
     case 'files': renderJobFiles(content, job); break;
+    case 'claude_code': renderJobClaudeCode(content, job); break;
   }
 }
 
@@ -1441,6 +1464,131 @@ function readJobFile(path) {
       + '<pre class="job-files-content">' + escapeHtml(data.content) + '</pre>';
   }).catch((err) => {
     viewer.innerHTML = '<div class="empty-state">Error: ' + escapeHtml(err.message) + '</div>';
+  });
+}
+
+// --- Claude Code tab ---
+
+let claudeCodeCurrentJobId = null;
+
+function renderJobClaudeCode(container, job) {
+  claudeCodeCurrentJobId = job ? job.id : null;
+
+  container.innerHTML = '<div class="cc-terminal" id="cc-terminal"></div>'
+    + '<div class="cc-input-bar" id="cc-input-bar">'
+    + '<input type="text" id="cc-prompt-input" placeholder="Send follow-up prompt..." />'
+    + '<button id="cc-send-btn">Send</button>'
+    + '<button id="cc-done-btn" title="Signal done">Done</button>'
+    + '</div>';
+
+  const terminal = document.getElementById('cc-terminal');
+  const input = document.getElementById('cc-prompt-input');
+  const sendBtn = document.getElementById('cc-send-btn');
+  const doneBtn = document.getElementById('cc-done-btn');
+
+  sendBtn.addEventListener('click', () => sendClaudeCodePrompt(job.id, false));
+  doneBtn.addEventListener('click', () => sendClaudeCodePrompt(job.id, true));
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendClaudeCodePrompt(job.id, false);
+  });
+
+  // Load persisted events from DB first
+  apiFetch('/api/jobs/' + job.id + '/events').then((data) => {
+    if (data.events && data.events.length > 0) {
+      for (const evt of data.events) {
+        appendClaudeCodeEvent(terminal, evt.event_type, evt.data);
+      }
+    }
+    // Then append any live SSE events buffered in memory
+    const live = claudeCodeEvents.get(job.id) || [];
+    for (const evt of live) {
+      appendClaudeCodeEvent(terminal, evt.type.replace('claude_code_', ''), evt.data);
+    }
+    terminal.scrollTop = terminal.scrollHeight;
+  }).catch(() => {
+    // If DB load fails, still show live events
+    const live = claudeCodeEvents.get(job.id) || [];
+    for (const evt of live) {
+      appendClaudeCodeEvent(terminal, evt.type.replace('claude_code_', ''), evt.data);
+    }
+  });
+}
+
+function appendClaudeCodeEvent(terminal, eventType, data) {
+  if (!terminal) return;
+  const el = document.createElement('div');
+  el.className = 'cc-event cc-event-' + eventType;
+
+  switch (eventType) {
+    case 'message':
+      el.innerHTML = '<span class="cc-role">' + escapeHtml(data.role || 'assistant') + '</span> '
+        + '<span class="cc-content">' + escapeHtml(data.content || '') + '</span>';
+      break;
+    case 'tool_use':
+      el.innerHTML = '<details class="cc-tool-block"><summary>'
+        + '<span class="cc-tool-icon">&#9881;</span> '
+        + escapeHtml(data.tool_name || 'tool')
+        + '</summary><pre class="cc-tool-input">'
+        + escapeHtml(typeof data.input === 'string' ? data.input : JSON.stringify(data.input, null, 2))
+        + '</pre></details>';
+      break;
+    case 'tool_result':
+      el.innerHTML = '<details class="cc-tool-block cc-tool-result"><summary>'
+        + '<span class="cc-tool-icon">&#10003;</span> '
+        + escapeHtml(data.tool_name || 'result')
+        + '</summary><pre class="cc-tool-output">'
+        + escapeHtml(data.output || '')
+        + '</pre></details>';
+      break;
+    case 'status':
+      el.innerHTML = '<span class="cc-status">' + escapeHtml(data.message || '') + '</span>';
+      break;
+    case 'result':
+      el.className += ' cc-final';
+      el.innerHTML = '<span class="cc-result-status">' + escapeHtml(data.status || 'done') + '</span>';
+      if (data.session_id) {
+        el.innerHTML += ' <span class="cc-session-id">session: ' + escapeHtml(data.session_id) + '</span>';
+      }
+      break;
+    default:
+      el.innerHTML = '<span class="cc-status">' + escapeHtml(JSON.stringify(data)) + '</span>';
+  }
+
+  terminal.appendChild(el);
+}
+
+function refreshClaudeCodeTab(jobId) {
+  if (claudeCodeCurrentJobId !== jobId) return;
+  if (currentJobSubTab !== 'claude_code') return;
+  const terminal = document.getElementById('cc-terminal');
+  if (!terminal) return;
+  const live = claudeCodeEvents.get(jobId) || [];
+  if (live.length > 0) {
+    const lastEvt = live[live.length - 1];
+    appendClaudeCodeEvent(terminal, lastEvt.type.replace('claude_code_', ''), lastEvt.data);
+    terminal.scrollTop = terminal.scrollHeight;
+  }
+}
+
+function sendClaudeCodePrompt(jobId, done) {
+  const input = document.getElementById('cc-prompt-input');
+  const content = input ? input.value.trim() : '';
+  if (!content && !done) return;
+
+  apiFetch('/api/jobs/' + jobId + '/prompt', {
+    method: 'POST',
+    body: { content: content || '(done)', done: done },
+  }).then(() => {
+    if (input) input.value = '';
+    if (done) {
+      const bar = document.getElementById('cc-input-bar');
+      if (bar) bar.innerHTML = '<span class="cc-status">Done signal sent</span>';
+    }
+  }).catch((err) => {
+    const terminal = document.getElementById('cc-terminal');
+    if (terminal) {
+      appendClaudeCodeEvent(terminal, 'status', { message: 'Failed to send: ' + err.message });
+    }
   });
 }
 

@@ -117,6 +117,35 @@ pub enum SseEvent {
     Error { message: String },
     #[serde(rename = "heartbeat")]
     Heartbeat,
+
+    // Claude Code sandbox events
+    #[serde(rename = "claude_code_message")]
+    ClaudeCodeMessage {
+        job_id: String,
+        role: String,
+        content: String,
+    },
+    #[serde(rename = "claude_code_tool_use")]
+    ClaudeCodeToolUse {
+        job_id: String,
+        tool_name: String,
+        input: serde_json::Value,
+    },
+    #[serde(rename = "claude_code_tool_result")]
+    ClaudeCodeToolResult {
+        job_id: String,
+        tool_name: String,
+        output: String,
+    },
+    #[serde(rename = "claude_code_status")]
+    ClaudeCodeStatus { job_id: String, message: String },
+    #[serde(rename = "claude_code_result")]
+    ClaudeCodeResult {
+        job_id: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
 }
 
 // --- Memory ---
@@ -231,6 +260,8 @@ pub struct JobDetailResponse {
     pub project_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browse_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_mode: Option<String>,
     pub transitions: Vec<TransitionInfo>,
     pub actions: Vec<ActionInfo>,
     pub conversation: Vec<MessageInfo>,
@@ -455,6 +486,11 @@ impl WsServerMessage {
             SseEvent::AuthCompleted { .. } => "auth_completed",
             SseEvent::Error { .. } => "error",
             SseEvent::Heartbeat => "heartbeat",
+            SseEvent::ClaudeCodeMessage { .. } => "claude_code_message",
+            SseEvent::ClaudeCodeToolUse { .. } => "claude_code_tool_use",
+            SseEvent::ClaudeCodeToolResult { .. } => "claude_code_tool_result",
+            SseEvent::ClaudeCodeStatus { .. } => "claude_code_status",
+            SseEvent::ClaudeCodeResult { .. } => "claude_code_result",
         };
         let data = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
         WsServerMessage::Event {

@@ -35,6 +35,16 @@ use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
 
+/// Shared prompt queue: maps job IDs to pending follow-up prompts for Claude Code bridges.
+pub type PromptQueue = Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<
+            uuid::Uuid,
+            std::collections::VecDeque<crate::orchestrator::api::PendingPrompt>,
+        >,
+    >,
+>;
+
 /// Shared state for all gateway handlers.
 pub struct GatewayState {
     /// Channel to send messages to the agent loop.
@@ -57,6 +67,8 @@ pub struct GatewayState {
     pub store: Option<Arc<Store>>,
     /// Container job manager for sandbox operations.
     pub job_manager: Option<Arc<ContainerJobManager>>,
+    /// Prompt queue for Claude Code follow-up prompts.
+    pub prompt_queue: Option<PromptQueue>,
     /// User ID for this gateway.
     pub user_id: String,
     /// Shutdown signal sender.
@@ -115,6 +127,8 @@ pub async fn start_server(
         .route("/api/jobs/{id}", get(jobs_detail_handler))
         .route("/api/jobs/{id}/cancel", post(jobs_cancel_handler))
         .route("/api/jobs/{id}/restart", post(jobs_restart_handler))
+        .route("/api/jobs/{id}/prompt", post(jobs_prompt_handler))
+        .route("/api/jobs/{id}/events", get(jobs_events_handler))
         .route("/api/jobs/{id}/files/list", get(job_files_list_handler))
         .route("/api/jobs/{id}/files/read", get(job_files_read_handler))
         // Logs
@@ -822,6 +836,11 @@ async fn jobs_detail_handler(
                 repair_attempts: 0,
                 project_dir: Some(job.project_dir.clone()),
                 browse_url: Some(format!("/projects/{}", browse_id)),
+                job_mode: {
+                    // Look up job_mode from the DB (defaults to "worker" if not set)
+                    let mode = store.get_sandbox_job_mode(job.id).await.ok().flatten();
+                    mode.filter(|m| m != "worker")
+                },
                 transitions,
                 actions: Vec::new(),
                 conversation: Vec::new(),
@@ -927,6 +946,7 @@ async fn jobs_detail_handler(
         repair_attempts: ctx.repair_attempts,
         project_dir: None,
         browse_url: None,
+        job_mode: None,
         transitions,
         actions,
         conversation,
@@ -1046,9 +1066,15 @@ async fn jobs_restart_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Look up the original job's mode so the restart uses the same mode.
+    let mode = match store.get_sandbox_job_mode(old_job_id).await {
+        Ok(Some(m)) if m == "claude_code" => crate::orchestrator::job_manager::JobMode::ClaudeCode,
+        _ => crate::orchestrator::job_manager::JobMode::Worker,
+    };
+
     let project_dir = std::path::PathBuf::from(&old_job.project_dir);
     let _token = jm
-        .create_job(new_job_id, &old_job.task, Some(project_dir))
+        .create_job(new_job_id, &old_job.task, Some(project_dir), mode)
         .await
         .map_err(|e| {
             (
@@ -1066,6 +1092,84 @@ async fn jobs_restart_handler(
         "status": "restarted",
         "old_job_id": old_job_id,
         "new_job_id": new_job_id,
+    })))
+}
+
+// --- Claude Code prompt and events handlers ---
+
+/// Submit a follow-up prompt to a running Claude Code sandbox job.
+async fn jobs_prompt_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let prompt_queue = state.prompt_queue.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Claude Code not configured".to_string(),
+    ))?;
+
+    let job_id: uuid::Uuid = id
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
+
+    let content = body
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Missing 'content' field".to_string(),
+        ))?
+        .to_string();
+
+    let done = body.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let prompt = crate::orchestrator::api::PendingPrompt { content, done };
+
+    {
+        let mut queue = prompt_queue.lock().await;
+        queue.entry(job_id).or_default().push_back(prompt);
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "queued",
+        "job_id": job_id.to_string(),
+    })))
+}
+
+/// Load persisted Claude Code events for a job (for history replay on page open).
+async fn jobs_events_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Database not available".to_string(),
+    ))?;
+
+    let job_id: uuid::Uuid = id
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
+
+    let events = store
+        .list_claude_code_events(job_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let events_json: Vec<serde_json::Value> = events
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id,
+                "event_type": e.event_type,
+                "data": e.data,
+                "created_at": e.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "job_id": job_id.to_string(),
+        "events": events_json,
     })))
 }
 

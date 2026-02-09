@@ -644,6 +644,88 @@ impl Store {
     }
 }
 
+// ==================== Claude Code Events ====================
+
+/// A persisted Claude Code streaming event.
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeEventRecord {
+    pub id: i64,
+    pub job_id: Uuid,
+    pub event_type: String,
+    pub data: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Store {
+    /// Persist a Claude Code event (fire-and-forget from orchestrator handler).
+    pub async fn save_claude_code_event(
+        &self,
+        job_id: Uuid,
+        event_type: &str,
+        data: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn().await?;
+        conn.execute(
+            r#"
+            INSERT INTO claude_code_events (job_id, event_type, data)
+            VALUES ($1, $2, $3)
+            "#,
+            &[&job_id, &event_type, data],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Load all Claude Code events for a job, ordered by id.
+    pub async fn list_claude_code_events(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Vec<ClaudeCodeEventRecord>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, job_id, event_type, data, created_at
+                FROM claude_code_events
+                WHERE job_id = $1
+                ORDER BY id ASC
+                "#,
+                &[&job_id],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| ClaudeCodeEventRecord {
+                id: r.get("id"),
+                job_id: r.get("job_id"),
+                event_type: r.get("event_type"),
+                data: r.get("data"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    /// Update the job_mode column for a sandbox job.
+    pub async fn update_sandbox_job_mode(&self, id: Uuid, mode: &str) -> Result<(), DatabaseError> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "UPDATE agent_jobs SET job_mode = $2 WHERE id = $1",
+            &[&id, &mode],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Get the job_mode for a sandbox job.
+    pub async fn get_sandbox_job_mode(&self, id: Uuid) -> Result<Option<String>, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_opt("SELECT job_mode FROM agent_jobs WHERE id = $1", &[&id])
+            .await?;
+        Ok(row.map(|r| r.get("job_mode")))
+    }
+}
+
 fn parse_job_state(s: &str) -> JobState {
     match s {
         "pending" => JobState::Pending,

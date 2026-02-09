@@ -3,14 +3,19 @@
 //! This runs on a separate port (default 50051) from the web gateway.
 //! All endpoints are authenticated via per-job bearer tokens.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
+use crate::channels::web::types::SseEvent;
+use crate::history::Store;
 use crate::llm::{CompletionRequest, LlmProvider, ToolCompletionRequest};
 use crate::orchestrator::auth::TokenStore;
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -18,6 +23,14 @@ use crate::worker::api::{
     CompletionReport, JobDescription, ProxyCompletionRequest, ProxyCompletionResponse,
     ProxyToolCompletionRequest, ProxyToolCompletionResponse, StatusUpdate,
 };
+use crate::worker::claude_bridge::ClaudeEventPayload;
+
+/// A follow-up prompt queued for a Claude Code bridge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPrompt {
+    pub content: String,
+    pub done: bool,
+}
 
 /// Shared state for the orchestrator API.
 #[derive(Clone)]
@@ -25,6 +38,12 @@ pub struct OrchestratorState {
     pub llm: Arc<dyn LlmProvider>,
     pub job_manager: Arc<ContainerJobManager>,
     pub token_store: TokenStore,
+    /// Broadcast channel for Claude Code events (consumed by the web gateway SSE).
+    pub claude_event_tx: Option<broadcast::Sender<(Uuid, SseEvent)>>,
+    /// Buffered follow-up prompts for Claude Code bridges, keyed by job_id.
+    pub prompt_queue: Arc<Mutex<HashMap<Uuid, VecDeque<PendingPrompt>>>>,
+    /// Database handle for persisting Claude Code events.
+    pub store: Option<Arc<Store>>,
 }
 
 /// The orchestrator's internal API server.
@@ -42,6 +61,9 @@ impl OrchestratorApi {
             )
             .route("/worker/{job_id}/status", post(report_status))
             .route("/worker/{job_id}/complete", post(report_complete))
+            // Claude Code bridge endpoints
+            .route("/worker/{job_id}/claude_event", post(claude_event_handler))
+            .route("/worker/{job_id}/prompt", get(get_prompt_handler))
             .route("/health", get(health_check))
             .with_state(state)
     }
@@ -226,6 +248,147 @@ async fn report_complete(
     let _ = state.job_manager.complete_job(job_id, result).await;
 
     Ok(StatusCode::OK)
+}
+
+// -- Claude Code bridge handlers --
+
+/// Receive a Claude Code event from the bridge and broadcast + persist it.
+async fn claude_event_handler(
+    State(state): State<OrchestratorState>,
+    Path(job_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<ClaudeEventPayload>,
+) -> Result<StatusCode, StatusCode> {
+    let auth = get_auth_header(&headers);
+    validate_token(&state, job_id, auth.as_deref()).await?;
+
+    tracing::debug!(
+        job_id = %job_id,
+        event_type = %payload.event_type,
+        "Claude Code event received"
+    );
+
+    // Persist to DB (fire-and-forget)
+    if let Some(ref store) = state.store {
+        let store = Arc::clone(store);
+        let event_type = payload.event_type.clone();
+        let data = payload.data.clone();
+        tokio::spawn(async move {
+            if let Err(e) = store
+                .save_claude_code_event(job_id, &event_type, &data)
+                .await
+            {
+                tracing::warn!(job_id = %job_id, "Failed to persist Claude Code event: {}", e);
+            }
+        });
+    }
+
+    // Convert to SSE event and broadcast
+    let job_id_str = job_id.to_string();
+    let sse_event = match payload.event_type.as_str() {
+        "message" => SseEvent::ClaudeCodeMessage {
+            job_id: job_id_str,
+            role: payload
+                .data
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("assistant")
+                .to_string(),
+            content: payload
+                .data
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        },
+        "tool_use" => SseEvent::ClaudeCodeToolUse {
+            job_id: job_id_str,
+            tool_name: payload
+                .data
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            input: payload
+                .data
+                .get("input")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        },
+        "tool_result" => SseEvent::ClaudeCodeToolResult {
+            job_id: job_id_str,
+            tool_name: payload
+                .data
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            output: payload
+                .data
+                .get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        },
+        "result" => SseEvent::ClaudeCodeResult {
+            job_id: job_id_str,
+            status: payload
+                .data
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            session_id: payload
+                .data
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        },
+        _ => SseEvent::ClaudeCodeStatus {
+            job_id: job_id_str,
+            message: payload
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        },
+    };
+
+    // Broadcast via the channel (if configured)
+    if let Some(ref tx) = state.claude_event_tx {
+        let _ = tx.send((job_id, sse_event));
+    }
+
+    Ok(StatusCode::OK)
+}
+
+/// Return the next queued follow-up prompt for a Claude Code bridge.
+/// Returns 204 No Content if no prompt is available.
+async fn get_prompt_handler(
+    State(state): State<OrchestratorState>,
+    Path(job_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let auth = get_auth_header(&headers);
+    validate_token(&state, job_id, auth.as_deref()).await?;
+
+    let mut queue = state.prompt_queue.lock().await;
+    if let Some(prompts) = queue.get_mut(&job_id) {
+        if let Some(prompt) = prompts.pop_front() {
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "content": prompt.content,
+                    "done": prompt.done,
+                })),
+            ));
+        }
+    }
+
+    // Return 204 with an empty body. The Json wrapper requires some value
+    // but the status code signals "nothing here".
+    Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null)))
 }
 
 fn format_finish_reason(reason: crate::llm::FinishReason) -> String {

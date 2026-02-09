@@ -171,6 +171,46 @@ async fn main() -> anyhow::Result<()> {
 
             return Ok(());
         }
+        Some(Command::ClaudeBridge {
+            job_id,
+            orchestrator_url,
+            max_turns,
+            model,
+        }) => {
+            // Claude Code bridge mode: runs inside a Docker container.
+            // Spawns the `claude` CLI and streams output to the orchestrator.
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new("ironclaw=info")),
+                )
+                .init();
+
+            tracing::info!(
+                "Starting Claude Code bridge for job {} (orchestrator: {}, model: {})",
+                job_id,
+                orchestrator_url,
+                model
+            );
+
+            let config = ironclaw::worker::claude_bridge::ClaudeBridgeConfig {
+                job_id: *job_id,
+                orchestrator_url: orchestrator_url.clone(),
+                max_turns: *max_turns,
+                model: model.clone(),
+                timeout: std::time::Duration::from_secs(1800),
+            };
+
+            let runtime = ironclaw::worker::ClaudeBridgeRuntime::new(config)
+                .map_err(|e| anyhow::anyhow!("Claude bridge init failed: {}", e))?;
+
+            runtime
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("Claude bridge failed: {}", e))?;
+
+            return Ok(());
+        }
         Some(Command::Onboard {
             skip_auth,
             channels_only,
@@ -542,6 +582,20 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Shared state for Claude Code bridge (used by both orchestrator and web gateway)
+    let claude_event_tx: Option<
+        tokio::sync::broadcast::Sender<(uuid::Uuid, ironclaw::channels::web::types::SseEvent)>,
+    > = if config.claude_code.enabled {
+        let (tx, _) = tokio::sync::broadcast::channel(256);
+        Some(tx)
+    } else {
+        None
+    };
+    let prompt_queue = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        uuid::Uuid,
+        std::collections::VecDeque<ironclaw::orchestrator::api::PendingPrompt>,
+    >::new()));
+
     let container_job_manager: Option<Arc<ContainerJobManager>> = if config.sandbox.enabled {
         let token_store = TokenStore::new();
         let job_config = ContainerJobConfig {
@@ -549,6 +603,14 @@ async fn main() -> anyhow::Result<()> {
             memory_limit_mb: config.sandbox.memory_limit_mb,
             cpu_shares: config.sandbox.cpu_shares,
             orchestrator_port: 50051,
+            claude_config_dir: if config.claude_code.enabled {
+                Some(config.claude_code.config_dir.clone())
+            } else {
+                None
+            },
+            claude_code_model: config.claude_code.model.clone(),
+            claude_code_max_turns: config.claude_code.max_turns,
+            claude_code_memory_limit_mb: config.claude_code.memory_limit_mb,
         };
         let jm = Arc::new(ContainerJobManager::new(job_config, token_store.clone()));
 
@@ -560,6 +622,9 @@ async fn main() -> anyhow::Result<()> {
             llm: llm.clone(),
             job_manager: Arc::clone(&jm),
             token_store,
+            claude_event_tx: claude_event_tx.clone(),
+            prompt_queue: Arc::clone(&prompt_queue),
+            store: store.clone(),
         };
 
         tokio::spawn(async move {
@@ -569,6 +634,13 @@ async fn main() -> anyhow::Result<()> {
         });
 
         tracing::info!("Orchestrator API started on :50051, sandbox delegation enabled");
+        if config.claude_code.enabled {
+            tracing::info!(
+                "Claude Code sandbox mode available (model: {}, max_turns: {})",
+                config.claude_code.model,
+                config.claude_code.max_turns
+            );
+        }
         Some(jm)
     } else {
         None
@@ -825,6 +897,20 @@ async fn main() -> anyhow::Result<()> {
         }
         if let Some(ref jm) = container_job_manager {
             gw = gw.with_job_manager(Arc::clone(jm));
+        }
+        if config.claude_code.enabled {
+            gw = gw.with_prompt_queue(Arc::clone(&prompt_queue));
+
+            // Spawn a task to forward Claude Code events from the broadcast channel to SSE
+            if let Some(ref tx) = claude_event_tx {
+                let mut rx = tx.subscribe();
+                let gw_state = Arc::clone(gw.state());
+                tokio::spawn(async move {
+                    while let Ok((_job_id, event)) = rx.recv().await {
+                        gw_state.sse.broadcast(event);
+                    }
+                });
+            }
         }
 
         tracing::info!(

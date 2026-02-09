@@ -15,6 +15,30 @@ use crate::error::OrchestratorError;
 use crate::orchestrator::auth::TokenStore;
 use crate::sandbox::connect_docker;
 
+/// Which mode a sandbox container runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobMode {
+    /// Standard IronClaw worker with proxied LLM calls.
+    Worker,
+    /// Claude Code bridge that spawns the `claude` CLI directly.
+    ClaudeCode,
+}
+
+impl JobMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::ClaudeCode => "claude_code",
+        }
+    }
+}
+
+impl std::fmt::Display for JobMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// Configuration for the container job manager.
 #[derive(Debug, Clone)]
 pub struct ContainerJobConfig {
@@ -26,6 +50,14 @@ pub struct ContainerJobConfig {
     pub cpu_shares: u32,
     /// Port the orchestrator internal API listens on.
     pub orchestrator_port: u16,
+    /// Host directory containing Claude auth config (mounted read-only for ClaudeCode mode).
+    pub claude_config_dir: Option<PathBuf>,
+    /// Claude model to use in ClaudeCode mode.
+    pub claude_code_model: String,
+    /// Maximum turns for Claude Code.
+    pub claude_code_max_turns: u32,
+    /// Memory limit in MB for Claude Code containers (heavier than workers).
+    pub claude_code_memory_limit_mb: u64,
 }
 
 impl Default for ContainerJobConfig {
@@ -35,6 +67,10 @@ impl Default for ContainerJobConfig {
             memory_limit_mb: 2048,
             cpu_shares: 1024,
             orchestrator_port: 50051,
+            claude_config_dir: None,
+            claude_code_model: "sonnet".to_string(),
+            claude_code_max_turns: 50,
+            claude_code_memory_limit_mb: 4096,
         }
     }
 }
@@ -65,6 +101,7 @@ pub struct ContainerHandle {
     pub job_id: Uuid,
     pub container_id: String,
     pub state: ContainerState,
+    pub mode: JobMode,
     pub created_at: DateTime<Utc>,
     pub project_dir: Option<PathBuf>,
     pub task_description: String,
@@ -106,6 +143,7 @@ impl ContainerJobManager {
         job_id: Uuid,
         task: &str,
         project_dir: Option<PathBuf>,
+        mode: JobMode,
     ) -> Result<String, OrchestratorError> {
         // Generate auth token (stored in TokenStore, never logged)
         let token = self.token_store.create_token(job_id).await;
@@ -115,6 +153,7 @@ impl ContainerJobManager {
             job_id,
             container_id: String::new(), // set after container creation
             state: ContainerState::Creating,
+            mode,
             created_at: Utc::now(),
             project_dir: project_dir.clone(),
             task_description: task.to_string(),
@@ -154,13 +193,26 @@ impl ContainerJobManager {
             env_vec.push("IRONCLAW_WORKSPACE=/workspace".to_string());
         }
 
+        // Claude Code mode: mount host ~/.claude read-only for auth
+        if mode == JobMode::ClaudeCode {
+            if let Some(ref claude_dir) = self.config.claude_config_dir {
+                binds.push(format!("{}:/home/sandbox/.claude:ro", claude_dir.display()));
+            }
+        }
+
+        // Memory limit: Claude Code gets more memory
+        let memory_mb = match mode {
+            JobMode::ClaudeCode => self.config.claude_code_memory_limit_mb,
+            JobMode::Worker => self.config.memory_limit_mb,
+        };
+
         // Create the container
         use bollard::container::{Config, CreateContainerOptions};
         use bollard::models::HostConfig;
 
         let host_config = HostConfig {
             binds: if binds.is_empty() { None } else { Some(binds) },
-            memory: Some((self.config.memory_limit_mb * 1024 * 1024) as i64),
+            memory: Some((memory_mb * 1024 * 1024) as i64),
             cpu_shares: Some(self.config.cpu_shares as i64),
             network_mode: Some("bridge".to_string()),
             extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
@@ -179,15 +231,31 @@ impl ContainerJobManager {
             ..Default::default()
         };
 
-        let container_config = Config {
-            image: Some(self.config.image.clone()),
-            cmd: Some(vec![
+        // Build CMD based on mode
+        let cmd = match mode {
+            JobMode::Worker => vec![
                 "worker".to_string(),
                 "--job-id".to_string(),
                 job_id.to_string(),
                 "--orchestrator-url".to_string(),
                 orchestrator_url,
-            ]),
+            ],
+            JobMode::ClaudeCode => vec![
+                "claude-bridge".to_string(),
+                "--job-id".to_string(),
+                job_id.to_string(),
+                "--orchestrator-url".to_string(),
+                orchestrator_url,
+                "--max-turns".to_string(),
+                self.config.claude_code_max_turns.to_string(),
+                "--model".to_string(),
+                self.config.claude_code_model.clone(),
+            ],
+        };
+
+        let container_config = Config {
+            image: Some(self.config.image.clone()),
+            cmd: Some(cmd),
             env: Some(env_vec),
             host_config: Some(host_config),
             user: Some("1000:1000".to_string()),
@@ -195,7 +263,10 @@ impl ContainerJobManager {
             ..Default::default()
         };
 
-        let container_name = format!("ironclaw-worker-{}", job_id);
+        let container_name = match mode {
+            JobMode::Worker => format!("ironclaw-worker-{}", job_id),
+            JobMode::ClaudeCode => format!("ironclaw-claude-{}", job_id),
+        };
         let options = CreateContainerOptions {
             name: container_name,
             ..Default::default()

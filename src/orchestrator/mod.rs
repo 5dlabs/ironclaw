@@ -32,4 +32,6 @@ pub mod job_manager;
 
 pub use api::OrchestratorApi;
 pub use auth::TokenStore;
-pub use job_manager::{CompletionResult, ContainerHandle, ContainerJobConfig, ContainerJobManager};
+pub use job_manager::{
+    CompletionResult, ContainerHandle, ContainerJobConfig, ContainerJobManager, JobMode,
+};

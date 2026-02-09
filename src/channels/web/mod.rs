@@ -79,6 +79,7 @@ impl GatewayChannel {
             tool_registry: None,
             store: None,
             job_manager: None,
+            prompt_queue: None,
             user_id: config.user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
@@ -104,6 +105,7 @@ impl GatewayChannel {
             tool_registry: self.state.tool_registry.clone(),
             store: self.state.store.clone(),
             job_manager: self.state.job_manager.clone(),
+            prompt_queue: self.state.prompt_queue.clone(),
             user_id: self.state.user_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: self.state.ws_tracker.clone(),
@@ -157,6 +159,22 @@ impl GatewayChannel {
     /// Inject the container job manager for sandbox operations.
     pub fn with_job_manager(mut self, jm: Arc<ContainerJobManager>) -> Self {
         self.rebuild_state(|s| s.job_manager = Some(jm));
+        self
+    }
+
+    /// Inject the prompt queue for Claude Code follow-up prompts.
+    pub fn with_prompt_queue(
+        mut self,
+        pq: Arc<
+            tokio::sync::Mutex<
+                std::collections::HashMap<
+                    uuid::Uuid,
+                    std::collections::VecDeque<crate::orchestrator::api::PendingPrompt>,
+                >,
+            >,
+        >,
+    ) -> Self {
+        self.rebuild_state(|s| s.prompt_queue = Some(pq));
         self
     }
 

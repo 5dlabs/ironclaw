@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::context::JobContext;
 use crate::history::{SandboxJobRecord, Store};
-use crate::orchestrator::job_manager::ContainerJobManager;
+use crate::orchestrator::job_manager::{ContainerJobManager, JobMode};
 use crate::tools::tool::{Tool, ToolError, ToolOutput};
 
 /// Tool for delegating filesystem/shell work to a sandboxed Docker container.
@@ -115,7 +115,8 @@ impl Tool for RunInSandboxTool {
         "Execute a task in a sandboxed Docker container. The container has its own \
          sub-agent with shell, file read/write, list_dir, and apply_patch tools. \
          Use this for any work that requires filesystem access or shell commands. \
-         The task description should be clear enough for the sub-agent to work independently."
+         The task description should be clear enough for the sub-agent to work independently. \
+         Set mode to 'claude_code' for complex software engineering tasks (uses Claude Code CLI)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -136,6 +137,12 @@ impl Tool for RunInSandboxTool {
                     "type": "boolean",
                     "description": "If true (default), wait for the container to complete and return results. \
                                     If false, start the container and return the job_id immediately."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["worker", "claude_code"],
+                    "description": "Execution mode. 'worker' (default) uses the IronClaw sub-agent. \
+                                    'claude_code' uses Claude Code CLI for full agentic software engineering."
                 }
             },
             "required": ["task"]
@@ -164,6 +171,11 @@ impl Tool for RunInSandboxTool {
 
         let wait = params.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
 
+        let mode = match params.get("mode").and_then(|v| v.as_str()) {
+            Some("claude_code") => JobMode::ClaudeCode,
+            _ => JobMode::Worker,
+        };
+
         let start = std::time::Instant::now();
 
         // Use a single UUID for everything: job_id, project directory, DB row.
@@ -185,10 +197,25 @@ impl Tool for RunInSandboxTool {
             completed_at: None,
         });
 
+        // Persist the job mode to DB
+        if mode == JobMode::ClaudeCode {
+            if let Some(store) = self.store.clone() {
+                let job_id_copy = job_id;
+                tokio::spawn(async move {
+                    if let Err(e) = store
+                        .update_sandbox_job_mode(job_id_copy, "claude_code")
+                        .await
+                    {
+                        tracing::warn!(job_id = %job_id_copy, "Failed to set job mode: {}", e);
+                    }
+                });
+            }
+        }
+
         // Create the container job with the pre-determined job_id.
         let _token = self
             .job_manager
-            .create_job(job_id, task, Some(project_dir))
+            .create_job(job_id, task, Some(project_dir), mode)
             .await
             .map_err(|e| {
                 self.update_status(

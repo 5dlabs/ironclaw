@@ -105,6 +105,11 @@ impl WorkerHttpClient {
         }
     }
 
+    /// Get the base orchestrator URL.
+    pub fn orchestrator_url(&self) -> &str {
+        &self.orchestrator_url
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}/worker/{}/{}", self.orchestrator_url, self.job_id, path)
     }

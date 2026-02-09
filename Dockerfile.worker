@@ -43,13 +43,18 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0 \
     && chmod -R a+r /usr/local/rustup /usr/local/cargo
 
+# Install Claude Code CLI (for claude-bridge mode)
+RUN npm install -g @anthropic-ai/claude-code@latest
+
 # Copy the binary
 COPY --from=builder /build/target/release/ironclaw /usr/local/bin/ironclaw
 
 # Create non-root user (UID 1000 matches the orchestrator's container config)
 RUN useradd -m -u 1000 -s /bin/bash sandbox \
     && mkdir -p /workspace \
-    && chown sandbox:sandbox /workspace
+    && chown sandbox:sandbox /workspace \
+    && mkdir -p /home/sandbox/.claude \
+    && chown sandbox:sandbox /home/sandbox/.claude
 
 USER sandbox
 WORKDIR /workspace

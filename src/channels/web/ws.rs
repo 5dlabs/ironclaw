@@ -461,6 +461,7 @@ mod tests {
             tool_registry: None,
             store: None,
             job_manager: None,
+            prompt_queue: None,
             user_id: "test".to_string(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
