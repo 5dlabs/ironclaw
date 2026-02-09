@@ -9,13 +9,14 @@ use uuid::Uuid;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::heartbeat::spawn_heartbeat;
+use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::agent::session_manager::SessionManager;
 use crate::agent::submission::{Submission, SubmissionParser, SubmissionResult};
 use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, MessageIntent, Router, Scheduler};
 use crate::channels::{ChannelManager, IncomingMessage, OutgoingResponse, StatusUpdate};
-use crate::config::{AgentConfig, HeartbeatConfig};
+use crate::config::{AgentConfig, HeartbeatConfig, RoutineConfig};
 use crate::context::ContextManager;
 use crate::context::JobContext;
 use crate::error::Error;
@@ -77,6 +78,7 @@ pub struct Agent {
     session_manager: Arc<SessionManager>,
     context_monitor: ContextMonitor,
     heartbeat_config: Option<HeartbeatConfig>,
+    routine_config: Option<RoutineConfig>,
 }
 
 impl Agent {
@@ -89,6 +91,7 @@ impl Agent {
         deps: AgentDeps,
         channels: ChannelManager,
         heartbeat_config: Option<HeartbeatConfig>,
+        routine_config: Option<RoutineConfig>,
         context_manager: Option<Arc<ContextManager>>,
         session_manager: Option<Arc<SessionManager>>,
     ) -> Self {
@@ -116,6 +119,7 @@ impl Agent {
             session_manager,
             context_monitor: ContextMonitor::new(),
             heartbeat_config,
+            routine_config,
         }
     }
 
@@ -305,6 +309,85 @@ impl Agent {
             None
         };
 
+        // Spawn routine engine if enabled
+        let routine_handle = if let Some(ref rt_config) = self.routine_config {
+            if rt_config.enabled {
+                if let (Some(store), Some(workspace)) = (self.store(), self.workspace()) {
+                    // Set up notification channel (same pattern as heartbeat)
+                    let (notify_tx, mut notify_rx) =
+                        tokio::sync::mpsc::channel::<OutgoingResponse>(32);
+
+                    let engine = Arc::new(RoutineEngine::new(
+                        rt_config.clone(),
+                        Arc::clone(store),
+                        self.llm().clone(),
+                        Arc::clone(workspace),
+                        notify_tx,
+                    ));
+
+                    // Register routine tools
+                    self.deps
+                        .tools
+                        .register_routine_tools(Arc::clone(store), Arc::clone(&engine));
+
+                    // Load initial event cache
+                    engine.refresh_event_cache().await;
+
+                    // Spawn notification forwarder
+                    let channels = self.channels.clone();
+                    tokio::spawn(async move {
+                        while let Some(response) = notify_rx.recv().await {
+                            let user = response
+                                .metadata
+                                .get("notify_user")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("default")
+                                .to_string();
+                            let results = channels.broadcast_all(&user, response).await;
+                            for (ch, result) in results {
+                                if let Err(e) = result {
+                                    tracing::warn!(
+                                        "Failed to broadcast routine notification to {}: {}",
+                                        ch,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    });
+
+                    // Spawn cron ticker
+                    let cron_interval =
+                        std::time::Duration::from_secs(rt_config.cron_check_interval_secs);
+                    let cron_handle = spawn_cron_ticker(Arc::clone(&engine), cron_interval);
+
+                    // Store engine reference for event trigger checking
+                    // Safety: we're in run() which takes self, no other reference exists
+                    let engine_ref = Arc::clone(&engine);
+                    // SAFETY: self is consumed by run(), we can smuggle the engine in
+                    // via a local to use in the message loop below.
+
+                    tracing::info!(
+                        "Routines enabled: cron ticker every {}s, max {} concurrent",
+                        rt_config.cron_check_interval_secs,
+                        rt_config.max_concurrent_routines
+                    );
+
+                    Some((cron_handle, engine_ref))
+                } else {
+                    tracing::warn!("Routines enabled but store/workspace not available");
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Extract engine ref for use in message loop
+        let routine_engine_for_loop = routine_handle.as_ref().map(|(_, e)| Arc::clone(e));
+
         // Main message loop
         tracing::info!("Agent {} ready and listening", self.config.name);
 
@@ -349,6 +432,14 @@ impl Agent {
                         .await;
                 }
             }
+
+            // Check event triggers (cheap in-memory regex, fires async if matched)
+            if let Some(ref engine) = routine_engine_for_loop {
+                let fired = engine.check_event_triggers(&message).await;
+                if fired > 0 {
+                    tracing::debug!("Fired {} event-triggered routines", fired);
+                }
+            }
         }
 
         // Cleanup
@@ -357,6 +448,9 @@ impl Agent {
         pruning_handle.abort();
         if let Some(handle) = heartbeat_handle {
             handle.abort();
+        }
+        if let Some((cron_handle, _)) = routine_handle {
+            cron_handle.abort();
         }
         self.scheduler.stop_all().await;
         self.channels.shutdown_all().await?;

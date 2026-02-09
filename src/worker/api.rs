@@ -79,6 +79,21 @@ pub struct CompletionReport {
     pub iterations: u32,
 }
 
+/// Payload sent to the orchestrator for each job event (shared by worker and Claude Code bridge).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JobEventPayload {
+    pub event_type: String,
+    pub data: serde_json::Value,
+}
+
+/// Response from the prompt polling endpoint.
+#[derive(Debug, Deserialize)]
+pub struct PromptResponse {
+    pub content: String,
+    #[serde(default)]
+    pub done: bool,
+}
+
 impl WorkerHttpClient {
     /// Create a new client from environment.
     ///
@@ -252,6 +267,70 @@ impl WorkerHttpClient {
         }
 
         Ok(())
+    }
+
+    /// Post a job event to the orchestrator (fire-and-forget style, logs on failure).
+    pub async fn post_event(&self, payload: &JobEventPayload) {
+        let resp = self
+            .client
+            .post(self.url("event"))
+            .bearer_auth(&self.token)
+            .json(payload)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if !r.status().is_success() => {
+                tracing::debug!(
+                    job_id = %self.job_id,
+                    event_type = %payload.event_type,
+                    status = %r.status(),
+                    "Job event POST rejected"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    job_id = %self.job_id,
+                    event_type = %payload.event_type,
+                    "Job event POST failed: {}", e
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Poll the orchestrator for a follow-up prompt.
+    ///
+    /// Returns `None` if no prompt is available (204 No Content).
+    pub async fn poll_prompt(&self) -> Result<Option<PromptResponse>, WorkerError> {
+        let resp = self
+            .client
+            .get(self.url("prompt"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| WorkerError::ConnectionFailed {
+                url: self.orchestrator_url.clone(),
+                reason: e.to_string(),
+            })?;
+
+        if resp.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+
+        if !resp.status().is_success() {
+            return Err(WorkerError::OrchestratorRejected {
+                job_id: self.job_id,
+                reason: format!("prompt endpoint returned {}", resp.status()),
+            });
+        }
+
+        let prompt: PromptResponse =
+            resp.json().await.map_err(|e| WorkerError::LlmProxyFailed {
+                reason: format!("failed to parse prompt response: {}", e),
+            })?;
+
+        Ok(Some(prompt))
     }
 
     /// Signal job completion to the orchestrator.

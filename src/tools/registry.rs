@@ -15,8 +15,8 @@ use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder
 use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobStatusTool, JsonTool,
     ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
-    ReadFileTool, RunInSandboxTool, ShellTool, TimeTool, ToolActivateTool, ToolAuthTool,
-    ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
+    ReadFileTool, ShellTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolInstallTool,
+    ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
 };
 use crate::tools::tool::{Tool, ToolDomain};
 use crate::tools::wasm::{
@@ -186,24 +186,24 @@ impl ToolRegistry {
     /// Register job management tools.
     ///
     /// Job tools allow the LLM to create, list, check status, and cancel jobs.
-    /// These enable natural language job management without hardcoded intent parsing.
-    ///
-    /// When `sandbox_enabled` is true, `create_job` is skipped because
-    /// `run_in_sandbox` already creates tracked sandbox jobs. Registering both
-    /// causes duplicates: the LLM calls `create_job` (pending placeholder) then
-    /// `run_in_sandbox` (actual execution), producing two entries in the jobs list.
-    pub fn register_job_tools(&self, context_manager: Arc<ContextManager>, sandbox_enabled: bool) {
-        let mut count = 0;
-        if !sandbox_enabled {
-            self.register_sync(Arc::new(CreateJobTool::new(Arc::clone(&context_manager))));
-            count += 1;
+    /// When sandbox deps are provided, `create_job` automatically delegates to
+    /// Docker containers. Otherwise it creates in-memory jobs via ContextManager.
+    pub fn register_job_tools(
+        &self,
+        context_manager: Arc<ContextManager>,
+        job_manager: Option<Arc<ContainerJobManager>>,
+        store: Option<Arc<Store>>,
+    ) {
+        let mut create_tool = CreateJobTool::new(Arc::clone(&context_manager));
+        if let Some(jm) = job_manager {
+            create_tool = create_tool.with_sandbox(jm, store);
         }
+        self.register_sync(Arc::new(create_tool));
         self.register_sync(Arc::new(ListJobsTool::new(Arc::clone(&context_manager))));
         self.register_sync(Arc::new(JobStatusTool::new(Arc::clone(&context_manager))));
         self.register_sync(Arc::new(CancelJobTool::new(context_manager)));
-        count += 3;
 
-        tracing::info!("Registered {} job management tools", count);
+        tracing::info!("Registered 4 job management tools");
     }
 
     /// Register extension management tools (search, install, auth, activate, list, remove).
@@ -219,17 +219,34 @@ impl ToolRegistry {
         tracing::info!("Registered 6 extension management tools");
     }
 
-    /// Register the sandbox delegation tool.
+    /// Register routine management tools.
     ///
-    /// This tool allows the orchestrator LLM to delegate filesystem/shell work
-    /// to a sandboxed Docker container with its own sub-agent.
-    pub fn register_sandbox_tool(
+    /// These allow the LLM to create, list, update, delete, and view history
+    /// of routines (scheduled and event-driven tasks).
+    pub fn register_routine_tools(
         &self,
-        job_manager: Arc<ContainerJobManager>,
-        store: Option<Arc<Store>>,
+        store: Arc<Store>,
+        engine: Arc<crate::agent::routine_engine::RoutineEngine>,
     ) {
-        self.register_sync(Arc::new(RunInSandboxTool::new(job_manager, store)));
-        tracing::info!("Registered run_in_sandbox tool");
+        use crate::tools::builtin::{
+            RoutineCreateTool, RoutineDeleteTool, RoutineHistoryTool, RoutineListTool,
+            RoutineUpdateTool,
+        };
+        self.register_sync(Arc::new(RoutineCreateTool::new(
+            Arc::clone(&store),
+            Arc::clone(&engine),
+        )));
+        self.register_sync(Arc::new(RoutineListTool::new(Arc::clone(&store))));
+        self.register_sync(Arc::new(RoutineUpdateTool::new(
+            Arc::clone(&store),
+            Arc::clone(&engine),
+        )));
+        self.register_sync(Arc::new(RoutineDeleteTool::new(
+            Arc::clone(&store),
+            Arc::clone(&engine),
+        )));
+        self.register_sync(Arc::new(RoutineHistoryTool::new(store)));
+        tracing::info!("Registered 5 routine management tools");
     }
 
     /// Register the software builder tool.

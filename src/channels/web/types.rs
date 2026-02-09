@@ -118,29 +118,29 @@ pub enum SseEvent {
     #[serde(rename = "heartbeat")]
     Heartbeat,
 
-    // Claude Code sandbox events
-    #[serde(rename = "claude_code_message")]
-    ClaudeCodeMessage {
+    // Sandbox job streaming events (worker + Claude Code bridge)
+    #[serde(rename = "job_message")]
+    JobMessage {
         job_id: String,
         role: String,
         content: String,
     },
-    #[serde(rename = "claude_code_tool_use")]
-    ClaudeCodeToolUse {
+    #[serde(rename = "job_tool_use")]
+    JobToolUse {
         job_id: String,
         tool_name: String,
         input: serde_json::Value,
     },
-    #[serde(rename = "claude_code_tool_result")]
-    ClaudeCodeToolResult {
+    #[serde(rename = "job_tool_result")]
+    JobToolResult {
         job_id: String,
         tool_name: String,
         output: String,
     },
-    #[serde(rename = "claude_code_status")]
-    ClaudeCodeStatus { job_id: String, message: String },
-    #[serde(rename = "claude_code_result")]
-    ClaudeCodeResult {
+    #[serde(rename = "job_status")]
+    JobStatus { job_id: String, message: String },
+    #[serde(rename = "job_result")]
+    JobResult {
         job_id: String,
         status: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,7 +220,6 @@ pub struct JobInfo {
     pub title: String,
     pub state: String,
     pub user_id: String,
-    pub source: String,
     pub created_at: String,
     pub started_at: Option<String>,
 }
@@ -246,16 +245,11 @@ pub struct JobDetailResponse {
     pub title: String,
     pub description: String,
     pub state: String,
-    pub category: Option<String>,
     pub user_id: String,
-    pub source: String,
     pub created_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub elapsed_secs: Option<u64>,
-    pub actual_cost: String,
-    pub estimated_cost: Option<String>,
-    pub repair_attempts: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -263,8 +257,6 @@ pub struct JobDetailResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_mode: Option<String>,
     pub transitions: Vec<TransitionInfo>,
-    pub actions: Vec<ActionInfo>,
-    pub conversation: Vec<MessageInfo>,
 }
 
 // --- Project Files ---
@@ -293,38 +285,6 @@ pub struct TransitionInfo {
     pub to: String,
     pub timestamp: String,
     pub reason: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ActionInfo {
-    pub id: Uuid,
-    pub sequence: u32,
-    pub tool_name: String,
-    pub input: serde_json::Value,
-    pub output: Option<String>,
-    pub duration_ms: u64,
-    pub success: bool,
-    pub error: Option<String>,
-    pub executed_at: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MessageInfo {
-    pub role: String,
-    pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<MessageToolCallInfo>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MessageToolCallInfo {
-    pub id: String,
-    pub name: String,
-    pub arguments: serde_json::Value,
 }
 
 // --- Extensions ---
@@ -486,11 +446,11 @@ impl WsServerMessage {
             SseEvent::AuthCompleted { .. } => "auth_completed",
             SseEvent::Error { .. } => "error",
             SseEvent::Heartbeat => "heartbeat",
-            SseEvent::ClaudeCodeMessage { .. } => "claude_code_message",
-            SseEvent::ClaudeCodeToolUse { .. } => "claude_code_tool_use",
-            SseEvent::ClaudeCodeToolResult { .. } => "claude_code_tool_result",
-            SseEvent::ClaudeCodeStatus { .. } => "claude_code_status",
-            SseEvent::ClaudeCodeResult { .. } => "claude_code_result",
+            SseEvent::JobMessage { .. } => "job_message",
+            SseEvent::JobToolUse { .. } => "job_tool_use",
+            SseEvent::JobToolResult { .. } => "job_tool_result",
+            SseEvent::JobStatus { .. } => "job_status",
+            SseEvent::JobResult { .. } => "job_result",
         };
         let data = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
         WsServerMessage::Event {

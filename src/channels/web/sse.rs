@@ -83,11 +83,11 @@ impl SseManager {
                     SseEvent::AuthCompleted { .. } => "auth_completed",
                     SseEvent::Error { .. } => "error",
                     SseEvent::JobStarted { .. } => "job_started",
-                    SseEvent::ClaudeCodeMessage { .. } => "claude_code_message",
-                    SseEvent::ClaudeCodeToolUse { .. } => "claude_code_tool_use",
-                    SseEvent::ClaudeCodeToolResult { .. } => "claude_code_tool_result",
-                    SseEvent::ClaudeCodeStatus { .. } => "claude_code_status",
-                    SseEvent::ClaudeCodeResult { .. } => "claude_code_result",
+                    SseEvent::JobMessage { .. } => "job_message",
+                    SseEvent::JobToolUse { .. } => "job_tool_use",
+                    SseEvent::JobToolResult { .. } => "job_tool_result",
+                    SseEvent::JobStatus { .. } => "job_status",
+                    SseEvent::JobResult { .. } => "job_result",
                     SseEvent::Heartbeat => "heartbeat",
                 };
                 Ok(Event::default().event(event_type).data(data))

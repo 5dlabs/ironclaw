@@ -28,7 +28,6 @@ use crate::channels::web::auth::{AuthState, auth_middleware};
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
-use crate::context::ContextManager;
 use crate::extensions::ExtensionManager;
 use crate::history::Store;
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -53,8 +52,6 @@ pub struct GatewayState {
     pub sse: SseManager,
     /// Workspace for memory API.
     pub workspace: Option<Arc<Workspace>>,
-    /// Context manager for jobs API.
-    pub context_manager: Option<Arc<ContextManager>>,
     /// Session manager for thread info.
     pub session_manager: Option<Arc<SessionManager>>,
     /// Log broadcaster for the logs SSE endpoint.
@@ -155,9 +152,12 @@ pub async fn start_server(
         .route("/style.css", get(css_handler))
         .route("/app.js", get(js_handler));
 
-    // Project file serving (no auth, local browsing of sandbox outputs)
+    // Project file serving (no auth, local browsing of sandbox outputs).
+    // The trailing-slash route serves index.html; the bare route redirects so
+    // relative paths in the HTML (e.g. href="style.css") resolve correctly.
     let projects = Router::new()
-        .route("/projects/{project_id}", get(project_index_handler))
+        .route("/projects/{project_id}", get(project_redirect_handler))
+        .route("/projects/{project_id}/", get(project_index_handler))
         .route("/projects/{project_id}/{*path}", get(project_file_handler));
 
     let app = Router::new()
@@ -670,9 +670,6 @@ async fn memory_search_handler(
 }
 
 // --- Jobs handlers ---
-//
-// Jobs are read from the database (both "direct" and "sandbox" sources).
-// This replaces the old ContextManager-only approach.
 
 async fn jobs_list_handler(
     State(state): State<Arc<GatewayState>>,
@@ -701,30 +698,11 @@ async fn jobs_list_handler(
                 title: j.task.clone(),
                 state: ui_state.to_string(),
                 user_id: j.user_id.clone(),
-                source: "sandbox".to_string(),
                 created_at: j.created_at.to_rfc3339(),
                 started_at: j.started_at.map(|dt| dt.to_rfc3339()),
             }
         })
         .collect();
-
-    // Also include "direct" jobs from ContextManager if available.
-    if let Some(ref cm) = state.context_manager {
-        let job_ids = cm.all_jobs_for(&state.user_id).await;
-        for job_id in job_ids {
-            if let Ok(ctx) = cm.get_context(job_id).await {
-                jobs.push(JobInfo {
-                    id: ctx.job_id,
-                    title: ctx.title.clone(),
-                    state: ctx.state.to_string(),
-                    user_id: ctx.user_id.clone(),
-                    source: "direct".to_string(),
-                    created_at: ctx.created_at.to_rfc3339(),
-                    started_at: ctx.started_at.map(|dt| dt.to_rfc3339()),
-                });
-            }
-        }
-    }
 
     // Most recent first.
     jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -745,32 +723,13 @@ async fn jobs_summary_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Map sandbox statuses to the UI model.
-    let mut total = s.total;
-    let mut pending = s.creating;
-    let mut in_progress = s.running;
-    let mut completed = s.completed;
-    let mut failed = s.failed + s.interrupted;
-    let mut stuck = 0usize;
-
-    // Merge in-memory direct jobs.
-    if let Some(ref cm) = state.context_manager {
-        let cm_summary = cm.summary_for(&state.user_id).await;
-        total += cm_summary.total;
-        pending += cm_summary.pending;
-        in_progress += cm_summary.in_progress;
-        completed += cm_summary.completed;
-        failed += cm_summary.failed;
-        stuck += cm_summary.stuck;
-    }
-
     Ok(Json(JobSummaryResponse {
-        total,
-        pending,
-        in_progress,
-        completed,
-        failed,
-        stuck,
+        total: s.total,
+        pending: s.creating,
+        in_progress: s.running,
+        completed: s.completed,
+        failed: s.failed + s.interrupted,
+        stuck: 0,
     }))
 }
 
@@ -824,133 +783,23 @@ async fn jobs_detail_handler(
                 title: job.task.clone(),
                 description: String::new(),
                 state: ui_state.to_string(),
-                category: None,
                 user_id: job.user_id.clone(),
-                source: "sandbox".to_string(),
                 created_at: job.created_at.to_rfc3339(),
                 started_at: job.started_at.map(|dt| dt.to_rfc3339()),
                 completed_at: job.completed_at.map(|dt| dt.to_rfc3339()),
                 elapsed_secs,
-                actual_cost: "0".to_string(),
-                estimated_cost: None,
-                repair_attempts: 0,
                 project_dir: Some(job.project_dir.clone()),
-                browse_url: Some(format!("/projects/{}", browse_id)),
+                browse_url: Some(format!("/projects/{}/", browse_id)),
                 job_mode: {
-                    // Look up job_mode from the DB (defaults to "worker" if not set)
                     let mode = store.get_sandbox_job_mode(job.id).await.ok().flatten();
                     mode.filter(|m| m != "worker")
                 },
                 transitions,
-                actions: Vec::new(),
-                conversation: Vec::new(),
             }));
         }
     }
 
-    // Fall back to ContextManager for "direct" jobs.
-    let context_manager = state
-        .context_manager
-        .as_ref()
-        .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?;
-
-    let ctx = context_manager
-        .get_context(job_id)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "Job not found".to_string()))?;
-
-    if ctx.user_id != state.user_id {
-        return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-    }
-
-    let transitions: Vec<TransitionInfo> = ctx
-        .transitions
-        .iter()
-        .map(|t| TransitionInfo {
-            from: t.from.to_string(),
-            to: t.to.to_string(),
-            timestamp: t.timestamp.to_rfc3339(),
-            reason: t.reason.clone(),
-        })
-        .collect();
-
-    let elapsed_secs = ctx.elapsed().map(|d| d.as_secs());
-
-    let memory = context_manager.get_memory(job_id).await.ok();
-
-    let actions: Vec<ActionInfo> = memory
-        .as_ref()
-        .map(|m| {
-            m.actions
-                .iter()
-                .map(|a| {
-                    let output = a
-                        .output_sanitized
-                        .as_ref()
-                        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()));
-                    ActionInfo {
-                        id: a.id,
-                        sequence: a.sequence,
-                        tool_name: a.tool_name.clone(),
-                        input: a.input.clone(),
-                        output,
-                        duration_ms: a.duration.as_millis() as u64,
-                        success: a.success,
-                        error: a.error.clone(),
-                        executed_at: a.executed_at.to_rfc3339(),
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let conversation: Vec<MessageInfo> = memory
-        .as_ref()
-        .map(|m| {
-            m.conversation
-                .messages()
-                .iter()
-                .map(|msg| MessageInfo {
-                    role: format!("{:?}", msg.role).to_lowercase(),
-                    content: msg.content.clone(),
-                    tool_calls: msg.tool_calls.as_ref().map(|tcs| {
-                        tcs.iter()
-                            .map(|tc| MessageToolCallInfo {
-                                id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                arguments: tc.arguments.clone(),
-                            })
-                            .collect()
-                    }),
-                    tool_call_id: msg.tool_call_id.clone(),
-                    name: msg.name.clone(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(Json(JobDetailResponse {
-        id: ctx.job_id,
-        title: ctx.title.clone(),
-        description: ctx.description.clone(),
-        state: ctx.state.to_string(),
-        category: ctx.category.clone(),
-        user_id: ctx.user_id.clone(),
-        source: "direct".to_string(),
-        created_at: ctx.created_at.to_rfc3339(),
-        started_at: ctx.started_at.map(|dt| dt.to_rfc3339()),
-        completed_at: ctx.completed_at.map(|dt| dt.to_rfc3339()),
-        elapsed_secs,
-        actual_cost: ctx.actual_cost.to_string(),
-        estimated_cost: ctx.estimated_cost.map(|c| c.to_string()),
-        repair_attempts: ctx.repair_attempts,
-        project_dir: None,
-        browse_url: None,
-        job_mode: None,
-        transitions,
-        actions,
-        conversation,
-    }))
+    Err((StatusCode::NOT_FOUND, "Job not found".to_string()))
 }
 
 async fn jobs_cancel_handler(
@@ -987,33 +836,7 @@ async fn jobs_cancel_handler(
         }
     }
 
-    // Fall back to ContextManager.
-    let context_manager = state
-        .context_manager
-        .as_ref()
-        .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?;
-
-    let ctx = context_manager
-        .get_context(job_id)
-        .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "Job not found".to_string()))?;
-
-    if ctx.user_id != state.user_id {
-        return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-    }
-
-    context_manager
-        .update_context(job_id, |ctx| {
-            ctx.transition_to(crate::context::JobState::Cancelled, None)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map_err(|msg| (StatusCode::CONFLICT, msg))?;
-
-    Ok(Json(serde_json::json!({
-        "status": "cancelled",
-        "job_id": job_id,
-    })))
+    Err((StatusCode::NOT_FOUND, "Job not found".to_string()))
 }
 
 async fn jobs_restart_handler(
@@ -1136,7 +959,7 @@ async fn jobs_prompt_handler(
     })))
 }
 
-/// Load persisted Claude Code events for a job (for history replay on page open).
+/// Load persisted job events for a job (for history replay on page open).
 async fn jobs_events_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
@@ -1151,7 +974,7 @@ async fn jobs_events_handler(
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
 
     let events = store
-        .list_claude_code_events(job_id)
+        .list_job_events(job_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1459,7 +1282,13 @@ async fn extensions_activate_handler(
 
 // --- Project file serving handlers ---
 
-/// Serve `index.html` when hitting `/projects/{project_id}` with no trailing path.
+/// Redirect `/projects/{id}` to `/projects/{id}/` so relative paths in
+/// the served HTML resolve within the project namespace.
+async fn project_redirect_handler(Path(project_id): Path<String>) -> impl IntoResponse {
+    axum::response::Redirect::permanent(&format!("/projects/{project_id}/"))
+}
+
+/// Serve `index.html` when hitting `/projects/{project_id}/`.
 async fn project_index_handler(Path(project_id): Path<String>) -> impl IntoResponse {
     serve_project_file(&project_id, "index.html").await
 }

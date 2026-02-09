@@ -27,7 +27,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::error::WorkerError;
-use crate::worker::api::{CompletionReport, WorkerHttpClient};
+use crate::worker::api::{CompletionReport, JobEventPayload, PromptResponse, WorkerHttpClient};
 
 /// Configuration for the Claude bridge runtime.
 pub struct ClaudeBridgeConfig {
@@ -98,21 +98,6 @@ pub struct ResultInfo {
     pub duration_ms: Option<u64>,
     #[serde(default)]
     pub num_turns: Option<u32>,
-}
-
-/// Payload sent to the orchestrator for each Claude Code event.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaudeEventPayload {
-    pub event_type: String,
-    pub data: serde_json::Value,
-}
-
-/// Response from the prompt polling endpoint.
-#[derive(Debug, Deserialize)]
-pub struct PromptResponse {
-    pub content: String,
-    #[serde(default)]
-    pub done: bool,
 }
 
 /// The Claude Code bridge runtime.
@@ -281,11 +266,11 @@ impl ClaudeBridgeRuntime {
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::debug!(job_id = %job_id, "claude stderr: {}", line);
-                let payload = ClaudeEventPayload {
+                let payload = JobEventPayload {
                     event_type: "status".to_string(),
                     data: serde_json::json!({ "message": line }),
                 };
-                let _ = post_claude_event(&client_for_stderr, job_id, &payload).await;
+                client_for_stderr.post_event(&payload).await;
             }
         });
 
@@ -380,105 +365,28 @@ impl ClaudeBridgeRuntime {
         Ok(session_id)
     }
 
-    /// Post a Claude event to the orchestrator.
+    /// Post a job event to the orchestrator.
     async fn report_event(&self, event_type: &str, data: &serde_json::Value) {
-        let payload = ClaudeEventPayload {
+        let payload = JobEventPayload {
             event_type: event_type.to_string(),
             data: data.clone(),
         };
-        if let Err(e) = post_claude_event(&self.client, self.config.job_id, &payload).await {
-            tracing::warn!(
-                job_id = %self.config.job_id,
-                event_type = event_type,
-                "Failed to post event: {}", e
-            );
-        }
+        self.client.post_event(&payload).await;
     }
 
     /// Poll the orchestrator for a follow-up prompt.
     async fn poll_for_prompt(&self) -> Result<Option<PromptResponse>, WorkerError> {
-        let url = format!(
-            "{}/worker/{}/prompt",
-            self.config.orchestrator_url.trim_end_matches('/'),
-            self.config.job_id
-        );
-
-        let token =
-            std::env::var("IRONCLAW_WORKER_TOKEN").map_err(|_| WorkerError::MissingToken)?;
-
-        let resp = reqwest::Client::new()
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| WorkerError::ConnectionFailed {
-                url: url.clone(),
-                reason: e.to_string(),
-            })?;
-
-        if resp.status() == reqwest::StatusCode::NO_CONTENT {
-            return Ok(None);
-        }
-
-        if !resp.status().is_success() {
-            return Err(WorkerError::OrchestratorRejected {
-                job_id: self.config.job_id,
-                reason: format!("prompt endpoint returned {}", resp.status()),
-            });
-        }
-
-        let prompt: PromptResponse =
-            resp.json().await.map_err(|e| WorkerError::LlmProxyFailed {
-                reason: format!("failed to parse prompt response: {}", e),
-            })?;
-
-        Ok(Some(prompt))
+        self.client.poll_prompt().await
     }
-}
-
-/// Post a Claude event payload to the orchestrator's event endpoint.
-async fn post_claude_event(
-    client: &WorkerHttpClient,
-    job_id: Uuid,
-    payload: &ClaudeEventPayload,
-) -> Result<(), WorkerError> {
-    let url = format!(
-        "{}/worker/{}/claude_event",
-        client.orchestrator_url().trim_end_matches('/'),
-        job_id
-    );
-
-    let token = std::env::var("IRONCLAW_WORKER_TOKEN").map_err(|_| WorkerError::MissingToken)?;
-
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .bearer_auth(&token)
-        .json(payload)
-        .send()
-        .await
-        .map_err(|e| WorkerError::ConnectionFailed {
-            url: url.clone(),
-            reason: e.to_string(),
-        })?;
-
-    if !resp.status().is_success() {
-        tracing::warn!(
-            job_id = %job_id,
-            status = %resp.status(),
-            "Claude event POST rejected"
-        );
-    }
-
-    Ok(())
 }
 
 /// Convert a Claude stream event into one or more event payloads for the orchestrator.
-fn stream_event_to_payloads(event: &ClaudeStreamEvent) -> Vec<ClaudeEventPayload> {
+fn stream_event_to_payloads(event: &ClaudeStreamEvent) -> Vec<JobEventPayload> {
     let mut payloads = Vec::new();
 
     match event.event_type.as_str() {
         "system" => {
-            payloads.push(ClaudeEventPayload {
+            payloads.push(JobEventPayload {
                 event_type: "status".to_string(),
                 data: serde_json::json!({
                     "message": "Claude Code session started",
@@ -493,7 +401,7 @@ fn stream_event_to_payloads(event: &ClaudeStreamEvent) -> Vec<ClaudeEventPayload
                     match block.block_type.as_str() {
                         "text" => {
                             if let Some(ref text) = block.text {
-                                payloads.push(ClaudeEventPayload {
+                                payloads.push(JobEventPayload {
                                     event_type: "message".to_string(),
                                     data: serde_json::json!({
                                         "role": "assistant",
@@ -503,7 +411,7 @@ fn stream_event_to_payloads(event: &ClaudeStreamEvent) -> Vec<ClaudeEventPayload
                             }
                         }
                         "tool_use" => {
-                            payloads.push(ClaudeEventPayload {
+                            payloads.push(JobEventPayload {
                                 event_type: "tool_use".to_string(),
                                 data: serde_json::json!({
                                     "tool_name": block.name,
@@ -512,7 +420,7 @@ fn stream_event_to_payloads(event: &ClaudeStreamEvent) -> Vec<ClaudeEventPayload
                             });
                         }
                         "tool_result" => {
-                            payloads.push(ClaudeEventPayload {
+                            payloads.push(JobEventPayload {
                                 event_type: "tool_result".to_string(),
                                 data: serde_json::json!({
                                     "tool_name": block.name.as_deref().unwrap_or("unknown"),
@@ -531,7 +439,7 @@ fn stream_event_to_payloads(event: &ClaudeStreamEvent) -> Vec<ClaudeEventPayload
                 .as_ref()
                 .and_then(|r| r.is_error)
                 .unwrap_or(false);
-            payloads.push(ClaudeEventPayload {
+            payloads.push(JobEventPayload {
                 event_type: "result".to_string(),
                 data: serde_json::json!({
                     "status": if is_error { "error" } else { "completed" },
@@ -543,7 +451,7 @@ fn stream_event_to_payloads(event: &ClaudeStreamEvent) -> Vec<ClaudeEventPayload
         }
         _ => {
             // Forward unknown event types as status
-            payloads.push(ClaudeEventPayload {
+            payloads.push(JobEventPayload {
                 event_type: "status".to_string(),
                 data: serde_json::json!({
                     "message": format!("Claude event: {}", event.event_type),
@@ -717,12 +625,12 @@ mod tests {
 
     #[test]
     fn test_claude_event_payload_serde() {
-        let payload = ClaudeEventPayload {
+        let payload = JobEventPayload {
             event_type: "message".to_string(),
             data: serde_json::json!({ "role": "assistant", "content": "hi" }),
         };
         let json = serde_json::to_string(&payload).unwrap();
-        let parsed: ClaudeEventPayload = serde_json::from_str(&json).unwrap();
+        let parsed: JobEventPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.event_type, "message");
         assert_eq!(parsed.data["content"], "hi");
     }

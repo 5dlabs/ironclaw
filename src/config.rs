@@ -21,6 +21,7 @@ pub struct Config {
     pub secrets: SecretsConfig,
     pub builder: BuilderModeConfig,
     pub heartbeat: HeartbeatConfig,
+    pub routines: RoutineConfig,
     pub sandbox: SandboxModeConfig,
     pub claude_code: ClaudeCodeConfig,
 }
@@ -43,6 +44,7 @@ impl Config {
             secrets: SecretsConfig::from_env()?,
             builder: BuilderModeConfig::from_env()?,
             heartbeat: HeartbeatConfig::from_env()?,
+            routines: RoutineConfig::from_env()?,
             sandbox: SandboxModeConfig::from_env()?,
             claude_code: ClaudeCodeConfig::from_env()?,
         })
@@ -454,7 +456,7 @@ pub struct AgentConfig {
     pub session_idle_timeout: Duration,
     /// Allow chat to use filesystem/shell tools directly (bypass sandbox).
     /// When false (default), container-domain tools are only available inside
-    /// Docker containers. The orchestrator LLM uses `run_in_sandbox` instead.
+    /// Docker containers. The orchestrator LLM uses `create_job` to delegate.
     pub allow_local_tools: bool,
 }
 
@@ -865,6 +867,52 @@ impl HeartbeatConfig {
                 .or(settings.heartbeat.notify_channel.clone()),
             notify_user: optional_env("HEARTBEAT_NOTIFY_USER")?
                 .or(settings.heartbeat.notify_user.clone()),
+        })
+    }
+}
+
+/// Routines configuration.
+#[derive(Debug, Clone)]
+pub struct RoutineConfig {
+    /// Whether the routines system is enabled.
+    pub enabled: bool,
+    /// How often (seconds) to poll for cron routines that need firing.
+    pub cron_check_interval_secs: u64,
+    /// Max routines executing concurrently across all users.
+    pub max_concurrent_routines: usize,
+    /// Default cooldown between fires (seconds).
+    pub default_cooldown_secs: u64,
+    /// Max output tokens for lightweight routine LLM calls.
+    pub max_lightweight_tokens: u32,
+}
+
+impl Default for RoutineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cron_check_interval_secs: 15,
+            max_concurrent_routines: 10,
+            default_cooldown_secs: 300,
+            max_lightweight_tokens: 4096,
+        }
+    }
+}
+
+impl RoutineConfig {
+    fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            enabled: optional_env("ROUTINES_ENABLED")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "ROUTINES_ENABLED".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(true),
+            cron_check_interval_secs: parse_optional_env("ROUTINES_CRON_INTERVAL", 15)?,
+            max_concurrent_routines: parse_optional_env("ROUTINES_MAX_CONCURRENT", 10)?,
+            default_cooldown_secs: parse_optional_env("ROUTINES_DEFAULT_COOLDOWN", 300)?,
+            max_lightweight_tokens: parse_optional_env("ROUTINES_MAX_TOKENS", 4096)?,
         })
     }
 }

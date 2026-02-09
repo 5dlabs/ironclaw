@@ -19,11 +19,11 @@ use crate::history::Store;
 use crate::llm::{CompletionRequest, LlmProvider, ToolCompletionRequest};
 use crate::orchestrator::auth::TokenStore;
 use crate::orchestrator::job_manager::ContainerJobManager;
+use crate::worker::api::JobEventPayload;
 use crate::worker::api::{
     CompletionReport, JobDescription, ProxyCompletionRequest, ProxyCompletionResponse,
     ProxyToolCompletionRequest, ProxyToolCompletionResponse, StatusUpdate,
 };
-use crate::worker::claude_bridge::ClaudeEventPayload;
 
 /// A follow-up prompt queued for a Claude Code bridge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,11 +38,11 @@ pub struct OrchestratorState {
     pub llm: Arc<dyn LlmProvider>,
     pub job_manager: Arc<ContainerJobManager>,
     pub token_store: TokenStore,
-    /// Broadcast channel for Claude Code events (consumed by the web gateway SSE).
-    pub claude_event_tx: Option<broadcast::Sender<(Uuid, SseEvent)>>,
-    /// Buffered follow-up prompts for Claude Code bridges, keyed by job_id.
+    /// Broadcast channel for job events (consumed by the web gateway SSE).
+    pub job_event_tx: Option<broadcast::Sender<(Uuid, SseEvent)>>,
+    /// Buffered follow-up prompts for sandbox jobs, keyed by job_id.
     pub prompt_queue: Arc<Mutex<HashMap<Uuid, VecDeque<PendingPrompt>>>>,
-    /// Database handle for persisting Claude Code events.
+    /// Database handle for persisting job events.
     pub store: Option<Arc<Store>>,
 }
 
@@ -61,8 +61,8 @@ impl OrchestratorApi {
             )
             .route("/worker/{job_id}/status", post(report_status))
             .route("/worker/{job_id}/complete", post(report_complete))
-            // Claude Code bridge endpoints
-            .route("/worker/{job_id}/claude_event", post(claude_event_handler))
+            // Sandbox job event endpoints (worker + Claude Code bridge)
+            .route("/worker/{job_id}/event", post(job_event_handler))
             .route("/worker/{job_id}/prompt", get(get_prompt_handler))
             .route("/health", get(health_check))
             .with_state(state)
@@ -250,14 +250,14 @@ async fn report_complete(
     Ok(StatusCode::OK)
 }
 
-// -- Claude Code bridge handlers --
+// -- Sandbox job event handlers --
 
-/// Receive a Claude Code event from the bridge and broadcast + persist it.
-async fn claude_event_handler(
+/// Receive a job event from a worker or Claude Code bridge and broadcast + persist it.
+async fn job_event_handler(
     State(state): State<OrchestratorState>,
     Path(job_id): Path<Uuid>,
     headers: axum::http::HeaderMap,
-    Json(payload): Json<ClaudeEventPayload>,
+    Json(payload): Json<JobEventPayload>,
 ) -> Result<StatusCode, StatusCode> {
     let auth = get_auth_header(&headers);
     validate_token(&state, job_id, auth.as_deref()).await?;
@@ -265,7 +265,7 @@ async fn claude_event_handler(
     tracing::debug!(
         job_id = %job_id,
         event_type = %payload.event_type,
-        "Claude Code event received"
+        "Job event received"
     );
 
     // Persist to DB (fire-and-forget)
@@ -274,11 +274,8 @@ async fn claude_event_handler(
         let event_type = payload.event_type.clone();
         let data = payload.data.clone();
         tokio::spawn(async move {
-            if let Err(e) = store
-                .save_claude_code_event(job_id, &event_type, &data)
-                .await
-            {
-                tracing::warn!(job_id = %job_id, "Failed to persist Claude Code event: {}", e);
+            if let Err(e) = store.save_job_event(job_id, &event_type, &data).await {
+                tracing::warn!(job_id = %job_id, "Failed to persist job event: {}", e);
             }
         });
     }
@@ -286,7 +283,7 @@ async fn claude_event_handler(
     // Convert to SSE event and broadcast
     let job_id_str = job_id.to_string();
     let sse_event = match payload.event_type.as_str() {
-        "message" => SseEvent::ClaudeCodeMessage {
+        "message" => SseEvent::JobMessage {
             job_id: job_id_str,
             role: payload
                 .data
@@ -301,7 +298,7 @@ async fn claude_event_handler(
                 .unwrap_or("")
                 .to_string(),
         },
-        "tool_use" => SseEvent::ClaudeCodeToolUse {
+        "tool_use" => SseEvent::JobToolUse {
             job_id: job_id_str,
             tool_name: payload
                 .data
@@ -315,7 +312,7 @@ async fn claude_event_handler(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
         },
-        "tool_result" => SseEvent::ClaudeCodeToolResult {
+        "tool_result" => SseEvent::JobToolResult {
             job_id: job_id_str,
             tool_name: payload
                 .data
@@ -330,7 +327,7 @@ async fn claude_event_handler(
                 .unwrap_or("")
                 .to_string(),
         },
-        "result" => SseEvent::ClaudeCodeResult {
+        "result" => SseEvent::JobResult {
             job_id: job_id_str,
             status: payload
                 .data
@@ -344,7 +341,7 @@ async fn claude_event_handler(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
         },
-        _ => SseEvent::ClaudeCodeStatus {
+        _ => SseEvent::JobStatus {
             job_id: job_id_str,
             message: payload
                 .data
@@ -356,7 +353,7 @@ async fn claude_event_handler(
     };
 
     // Broadcast via the channel (if configured)
-    if let Some(ref tx) = state.claude_event_tx {
+    if let Some(ref tx) = state.job_event_tx {
         let _ = tx.send((job_id, sse_event));
     }
 

@@ -2,6 +2,8 @@
 //!
 //! Reuses the existing `Reasoning` and `SafetyLayer` infrastructure but
 //! connects to the orchestrator for LLM calls instead of calling APIs directly.
+//! Streams real-time events (message, tool_use, tool_result, result) through
+//! the orchestrator's job event pipeline for UI visibility.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +18,7 @@ use crate::llm::{
 };
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
-use crate::worker::api::{CompletionReport, StatusUpdate, WorkerHttpClient};
+use crate::worker::api::{CompletionReport, JobEventPayload, StatusUpdate, WorkerHttpClient};
 use crate::worker::proxy_llm::ProxyLlmProvider;
 
 /// Configuration for the worker runtime.
@@ -41,7 +43,8 @@ impl Default for WorkerConfig {
 /// The worker runtime runs inside a Docker container.
 ///
 /// It connects to the orchestrator over HTTP, fetches its job description,
-/// then runs a tool execution loop until the job is complete.
+/// then runs a tool execution loop until the job is complete. Events are
+/// streamed to the orchestrator so the UI can show real-time progress.
 pub struct WorkerRuntime {
     config: WorkerConfig,
     client: Arc<WorkerHttpClient>,
@@ -131,6 +134,14 @@ Work independently to complete this job. Report when done."#,
         match result {
             Ok(Ok(output)) => {
                 tracing::info!("Worker completed job {} successfully", self.config.job_id);
+                self.post_event(
+                    "result",
+                    serde_json::json!({
+                        "success": true,
+                        "message": truncate(&output, 2000),
+                    }),
+                )
+                .await;
                 self.client
                     .report_complete(&CompletionReport {
                         success: true,
@@ -141,6 +152,14 @@ Work independently to complete this job. Report when done."#,
             }
             Ok(Err(e)) => {
                 tracing::error!("Worker failed for job {}: {}", self.config.job_id, e);
+                self.post_event(
+                    "result",
+                    serde_json::json!({
+                        "success": false,
+                        "message": format!("Execution failed: {}", e),
+                    }),
+                )
+                .await;
                 self.client
                     .report_complete(&CompletionReport {
                         success: false,
@@ -151,6 +170,14 @@ Work independently to complete this job. Report when done."#,
             }
             Err(_) => {
                 tracing::warn!("Worker timed out for job {}", self.config.job_id);
+                self.post_event(
+                    "result",
+                    serde_json::json!({
+                        "success": false,
+                        "message": "Execution timed out",
+                    }),
+                )
+                .await;
                 self.client
                     .report_complete(&CompletionReport {
                         success: false,
@@ -188,6 +215,9 @@ Work independently to complete this job. Report when done."#,
                     .await;
             }
 
+            // Poll for follow-up prompts from the user
+            self.poll_and_inject_prompt(reason_ctx).await;
+
             // Refresh tools (in case WASM tools were built)
             reason_ctx.available_tools = self.tools.tool_definitions().await;
 
@@ -210,6 +240,15 @@ Work independently to complete this job. Report when done."#,
 
                 match respond_result {
                     RespondResult::Text(response) => {
+                        self.post_event(
+                            "message",
+                            serde_json::json!({
+                                "role": "assistant",
+                                "content": truncate(&response, 2000),
+                            }),
+                        )
+                        .await;
+
                         let response_lower = response.to_lowercase();
                         if response_lower.contains("complete")
                             || response_lower.contains("finished")
@@ -226,6 +265,17 @@ Work independently to complete this job. Report when done."#,
                         tool_calls,
                         content,
                     } => {
+                        if let Some(ref text) = content {
+                            self.post_event(
+                                "message",
+                                serde_json::json!({
+                                    "role": "assistant",
+                                    "content": truncate(text, 2000),
+                                }),
+                            )
+                            .await;
+                        }
+
                         // Add assistant message with tool_calls (OpenAI protocol)
                         reason_ctx
                             .messages
@@ -235,7 +285,30 @@ Work independently to complete this job. Report when done."#,
                             ));
 
                         for tc in tool_calls {
+                            self.post_event(
+                                "tool_use",
+                                serde_json::json!({
+                                    "tool_name": tc.name,
+                                    "input": truncate(&tc.arguments.to_string(), 500),
+                                }),
+                            )
+                            .await;
+
                             let result = self.execute_tool(&tc.name, &tc.arguments).await;
+
+                            self.post_event(
+                                "tool_result",
+                                serde_json::json!({
+                                    "tool_name": tc.name,
+                                    "output": match &result {
+                                        Ok(output) => truncate(output, 2000),
+                                        Err(e) => format!("Error: {}", truncate(e, 500)),
+                                    },
+                                    "success": result.is_ok(),
+                                }),
+                            )
+                            .await;
+
                             if let Ok(ref output) = result {
                                 last_output = output.clone();
                             }
@@ -252,9 +325,31 @@ Work independently to complete this job. Report when done."#,
             } else {
                 // Execute selected tools
                 for selection in &selections {
+                    self.post_event(
+                        "tool_use",
+                        serde_json::json!({
+                            "tool_name": selection.tool_name,
+                            "input": truncate(&selection.parameters.to_string(), 500),
+                        }),
+                    )
+                    .await;
+
                     let result = self
                         .execute_tool(&selection.tool_name, &selection.parameters)
                         .await;
+
+                    self.post_event(
+                        "tool_result",
+                        serde_json::json!({
+                            "tool_name": selection.tool_name,
+                            "output": match &result {
+                                Ok(output) => truncate(output, 2000),
+                                Err(e) => format!("Error: {}", truncate(e, 500)),
+                            },
+                            "success": result.is_ok(),
+                        }),
+                    )
+                    .await;
 
                     if let Ok(ref output) = result {
                         last_output = output.clone();
@@ -346,6 +441,42 @@ Work independently to complete this job. Report when done."#,
                     format!("Error: {}", e),
                 ));
                 false
+            }
+        }
+    }
+
+    /// Post a job event to the orchestrator (fire-and-forget).
+    async fn post_event(&self, event_type: &str, data: serde_json::Value) {
+        self.client
+            .post_event(&JobEventPayload {
+                event_type: event_type.to_string(),
+                data,
+            })
+            .await;
+    }
+
+    /// Poll the orchestrator for a follow-up prompt. If one is available,
+    /// inject it as a user message into the reasoning context.
+    async fn poll_and_inject_prompt(&self, reason_ctx: &mut ReasoningContext) {
+        match self.client.poll_prompt().await {
+            Ok(Some(prompt)) => {
+                tracing::info!(
+                    "Received follow-up prompt: {}",
+                    truncate(&prompt.content, 100)
+                );
+                self.post_event(
+                    "message",
+                    serde_json::json!({
+                        "role": "user",
+                        "content": truncate(&prompt.content, 2000),
+                    }),
+                )
+                .await;
+                reason_ctx.messages.push(ChatMessage::user(&prompt.content));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!("Failed to poll for prompt: {}", e);
             }
         }
     }

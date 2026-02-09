@@ -41,7 +41,6 @@ async fn start_test_server() -> (
         msg_tx: tokio::sync::RwLock::new(Some(agent_tx)),
         sse: SseManager::new(),
         workspace: None,
-        context_manager: None,
         session_manager: None,
         log_broadcaster: None,
         extension_manager: None,

@@ -573,7 +573,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Set up orchestrator for sandboxed job execution
-    // When allow_local_tools is false (default), the LLM uses run_in_sandbox for FS/shell work.
+    // When allow_local_tools is false (default), the LLM uses create_job for FS/shell work.
     // When allow_local_tools is true, dev tools are also registered directly (current behavior).
     if config.agent.allow_local_tools {
         tools.register_dev_tools();
@@ -582,10 +582,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Shared state for Claude Code bridge (used by both orchestrator and web gateway)
-    let claude_event_tx: Option<
+    // Shared state for job events (used by both orchestrator and web gateway)
+    let job_event_tx: Option<
         tokio::sync::broadcast::Sender<(uuid::Uuid, ironclaw::channels::web::types::SseEvent)>,
-    > = if config.claude_code.enabled {
+    > = if config.sandbox.enabled {
         let (tx, _) = tokio::sync::broadcast::channel(256);
         Some(tx)
     } else {
@@ -614,15 +614,12 @@ async fn main() -> anyhow::Result<()> {
         };
         let jm = Arc::new(ContainerJobManager::new(job_config, token_store.clone()));
 
-        // Register the run_in_sandbox tool (with DB persistence if available)
-        tools.register_sandbox_tool(Arc::clone(&jm), store.clone());
-
         // Start the orchestrator internal API in the background
         let orchestrator_state = OrchestratorState {
             llm: llm.clone(),
             job_manager: Arc::clone(&jm),
             token_store,
-            claude_event_tx: claude_event_tx.clone(),
+            job_event_tx: job_event_tx.clone(),
             prompt_queue: Arc::clone(&prompt_queue),
             store: store.clone(),
         };
@@ -876,8 +873,12 @@ async fn main() -> anyhow::Result<()> {
     // Create session manager (shared between agent and web gateway)
     let session_manager = Arc::new(SessionManager::new());
 
-    // Register job tools (skip create_job when sandbox is enabled to avoid duplicates)
-    tools.register_job_tools(Arc::clone(&context_manager), config.sandbox.enabled);
+    // Register job tools (sandbox deps auto-injected when container_job_manager is available)
+    tools.register_job_tools(
+        Arc::clone(&context_manager),
+        container_job_manager.clone(),
+        store.clone(),
+    );
 
     // Add web gateway channel if configured
     if let Some(ref gw_config) = config.channels.gateway {
@@ -885,7 +886,6 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref ws) = workspace {
             gw = gw.with_workspace(Arc::clone(ws));
         }
-        gw = gw.with_context_manager(Arc::clone(&context_manager));
         gw = gw.with_session_manager(Arc::clone(&session_manager));
         gw = gw.with_log_broadcaster(Arc::clone(&log_broadcaster));
         gw = gw.with_tool_registry(Arc::clone(&tools));
@@ -898,11 +898,11 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref jm) = container_job_manager {
             gw = gw.with_job_manager(Arc::clone(jm));
         }
-        if config.claude_code.enabled {
+        if config.sandbox.enabled {
             gw = gw.with_prompt_queue(Arc::clone(&prompt_queue));
 
-            // Spawn a task to forward Claude Code events from the broadcast channel to SSE
-            if let Some(ref tx) = claude_event_tx {
+            // Spawn a task to forward job events from the broadcast channel to SSE
+            if let Some(ref tx) = job_event_tx {
                 let mut rx = tx.subscribe();
                 let gw_state = Arc::clone(gw.state());
                 tokio::spawn(async move {
@@ -942,6 +942,7 @@ async fn main() -> anyhow::Result<()> {
         deps,
         channels,
         Some(config.heartbeat.clone()),
+        Some(config.routines.clone()),
         Some(context_manager),
         Some(session_manager),
     );

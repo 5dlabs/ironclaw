@@ -10,7 +10,7 @@
 //!         ◄── GET  /api/chat/events ── SSE stream
 //!         ─── GET  /api/chat/ws ─────► WebSocket (bidirectional)
 //!         ─── GET  /api/memory/* ────► Workspace
-//!         ─── GET  /api/jobs/* ──────► ContextManager
+//!         ─── GET  /api/jobs/* ──────► Database
 //!         ◄── GET  / ───────────────── Static HTML/CSS/JS
 //! ```
 
@@ -31,7 +31,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::agent::SessionManager;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
 use crate::config::GatewayConfig;
-use crate::context::ContextManager;
 use crate::error::ChannelError;
 use crate::extensions::ExtensionManager;
 use crate::history::Store;
@@ -72,7 +71,6 @@ impl GatewayChannel {
             msg_tx: tokio::sync::RwLock::new(None),
             sse: SseManager::new(),
             workspace: None,
-            context_manager: None,
             session_manager: None,
             log_broadcaster: None,
             extension_manager: None,
@@ -98,7 +96,6 @@ impl GatewayChannel {
             msg_tx: tokio::sync::RwLock::new(None),
             sse: SseManager::new(),
             workspace: self.state.workspace.clone(),
-            context_manager: self.state.context_manager.clone(),
             session_manager: self.state.session_manager.clone(),
             log_broadcaster: self.state.log_broadcaster.clone(),
             extension_manager: self.state.extension_manager.clone(),
@@ -117,12 +114,6 @@ impl GatewayChannel {
     /// Inject the workspace reference for the memory API.
     pub fn with_workspace(mut self, workspace: Arc<Workspace>) -> Self {
         self.rebuild_state(|s| s.workspace = Some(workspace));
-        self
-    }
-
-    /// Inject the context manager for the jobs API.
-    pub fn with_context_manager(mut self, cm: Arc<ContextManager>) -> Self {
-        self.rebuild_state(|s| s.context_manager = Some(cm));
         self
     }
 

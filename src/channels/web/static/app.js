@@ -1141,7 +1141,7 @@ function loadJobs() {
     container.innerHTML =
       '<div class="jobs-summary" id="jobs-summary"></div>'
       + '<table class="jobs-table" id="jobs-table"><thead><tr>'
-      + '<th>ID</th><th>Title</th><th>Source</th><th>Status</th><th>Created</th><th>Actions</th>'
+      + '<th>ID</th><th>Title</th><th>Status</th><th>Created</th><th>Actions</th>'
       + '</tr></thead><tbody id="jobs-tbody"></tbody></table>'
       + '<div class="empty-state" id="jobs-empty" style="display:none">No jobs found</div>';
   }
@@ -1185,19 +1185,17 @@ function renderJobsList(jobs) {
   tbody.innerHTML = jobs.map((job) => {
     const shortId = job.id.substring(0, 8);
     const stateClass = job.state.replace(' ', '_');
-    const sourceClass = 'source-' + (job.source || 'direct');
 
     let actionBtns = '';
     if (job.state === 'pending' || job.state === 'in_progress') {
       actionBtns = '<button class="btn-cancel" onclick="event.stopPropagation(); cancelJob(\'' + job.id + '\')">Cancel</button>';
-    } else if ((job.state === 'failed' || job.state === 'interrupted') && job.source === 'sandbox') {
+    } else if (job.state === 'failed' || job.state === 'interrupted') {
       actionBtns = '<button class="btn-restart" onclick="event.stopPropagation(); restartJob(\'' + job.id + '\')">Restart</button>';
     }
 
     return '<tr class="job-row" onclick="openJobDetail(\'' + job.id + '\')">'
       + '<td title="' + escapeHtml(job.id) + '">' + shortId + '</td>'
       + '<td>' + escapeHtml(job.title) + '</td>'
-      + '<td><span class="badge ' + sourceClass + '">' + escapeHtml(job.source || 'direct') + '</span></td>'
       + '<td><span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span></td>'
       + '<td>' + formatDate(job.created_at) + '</td>'
       + '<td>' + actionBtns + '</td>'
@@ -1231,12 +1229,8 @@ function restartJob(jobId) {
 
 function openJobDetail(jobId) {
   currentJobId = jobId;
-  currentJobSubTab = 'overview';
+  currentJobSubTab = 'activity';
   apiFetch('/api/jobs/' + jobId).then((job) => {
-    // Sandbox jobs default to Activity tab where the live stream is
-    if (job.source === 'sandbox') {
-      currentJobSubTab = 'activity';
-    }
     renderJobDetail(job);
   }).catch((err) => {
     addMessage('system', 'Failed to load job: ' + err.message);
@@ -1253,7 +1247,6 @@ function closeJobDetail() {
 function renderJobDetail(job) {
   const container = document.querySelector('.jobs-container');
   const stateClass = job.state.replace(' ', '_');
-  const sourceClass = 'source-' + (job.source || 'direct');
 
   container.innerHTML = '';
 
@@ -1263,10 +1256,9 @@ function renderJobDetail(job) {
 
   let headerHtml = '<button class="btn-back" onclick="closeJobDetail()">&larr; Back</button>'
     + '<h2>' + escapeHtml(job.title) + '</h2>'
-    + '<span class="badge ' + sourceClass + '">' + escapeHtml(job.source || 'direct') + '</span>'
     + '<span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span>';
 
-  if ((job.state === 'failed' || job.state === 'interrupted') && job.source === 'sandbox') {
+  if (job.state === 'failed' || job.state === 'interrupted') {
     headerHtml += '<button class="btn-restart" onclick="restartJob(\'' + job.id + '\')">Restart</button>';
   }
   if (job.browse_url) {
@@ -1279,11 +1271,7 @@ function renderJobDetail(job) {
   // Sub-tab bar
   const tabs = document.createElement('div');
   tabs.className = 'job-detail-tabs';
-  // Sandbox jobs stream actions/conversation via events, so show Activity instead
-  // of the empty Actions/Thinking tabs.
-  const subtabs = (job && job.source === 'sandbox')
-    ? ['overview', 'activity', 'files']
-    : ['overview', 'actions', 'thinking', 'files'];
+  const subtabs = ['overview', 'activity', 'files'];
   for (const st of subtabs) {
     const btn = document.createElement('button');
     btn.textContent = st.charAt(0).toUpperCase() + st.slice(1);
@@ -1303,8 +1291,6 @@ function renderJobDetail(job) {
 
   switch (currentJobSubTab) {
     case 'overview': renderJobOverview(content, job); break;
-    case 'actions': renderJobActions(content, job); break;
-    case 'thinking': renderJobConversation(content, job); break;
     case 'files': renderJobFiles(content, job); break;
     case 'activity': renderJobActivity(content, job); break;
   }
@@ -1332,15 +1318,11 @@ function renderJobOverview(container, job) {
   grid.className = 'job-meta-grid';
   grid.innerHTML = metaItem('Job ID', job.id)
     + metaItem('State', job.state)
-    + metaItem('Source', job.source || 'direct')
-    + metaItem('Category', job.category || 'None')
     + metaItem('Created', formatDate(job.created_at))
     + metaItem('Started', formatDate(job.started_at))
     + metaItem('Completed', formatDate(job.completed_at))
     + metaItem('Duration', formatDuration(job.elapsed_secs))
-    + metaItem('Actual Cost', job.actual_cost)
-    + metaItem('Estimated Cost', job.estimated_cost || '-')
-    + metaItem('Repair Attempts', job.repair_attempts);
+    + (job.job_mode ? metaItem('Mode', job.job_mode) : '');
   container.appendChild(grid);
 
   // Description
@@ -1388,122 +1370,15 @@ function renderJobOverview(container, job) {
   }
 }
 
-function renderJobActions(container, job) {
-  if (job.actions.length === 0) {
-    container.innerHTML = '<div class="empty-state">No actions recorded</div>';
-    return;
-  }
-
-  for (const action of job.actions) {
-    const card = document.createElement('div');
-    card.className = 'action-card ' + (action.success ? 'success' : 'failure');
-
-    const header = document.createElement('div');
-    header.className = 'action-header';
-    header.innerHTML = '<span class="action-tool">' + escapeHtml(action.tool_name) + '</span>'
-      + '<span class="action-seq">#' + action.sequence + '</span>'
-      + '<span class="action-duration">' + action.duration_ms + 'ms</span>'
-      + '<span class="action-time">' + formatDate(action.executed_at) + '</span>'
-      + '<span class="action-toggle">&#9660;</span>';
-
-    const detail = document.createElement('div');
-    detail.className = 'action-detail';
-    detail.style.display = 'none';
-
-    let detailHtml = '<div class="action-section"><strong>Input</strong><pre class="action-json">'
-      + escapeHtml(JSON.stringify(action.input, null, 2)) + '</pre></div>';
-
-    if (action.output) {
-      detailHtml += '<div class="action-section"><strong>Output</strong><pre class="action-json">'
-        + escapeHtml(action.output) + '</pre></div>';
-    }
-
-    if (action.error) {
-      detailHtml += '<div class="action-section"><strong>Error</strong><pre class="action-error">'
-        + escapeHtml(action.error) + '</pre></div>';
-    }
-
-    detail.innerHTML = detailHtml;
-
-    header.addEventListener('click', () => {
-      const visible = detail.style.display !== 'none';
-      detail.style.display = visible ? 'none' : 'block';
-      header.querySelector('.action-toggle').textContent = visible ? '\u25BC' : '\u25B2';
-    });
-
-    card.appendChild(header);
-    card.appendChild(detail);
-    container.appendChild(card);
-  }
-}
-
-function renderJobConversation(container, job) {
-  if (job.conversation.length === 0) {
-    container.innerHTML = '<div class="empty-state">No conversation history</div>';
-    return;
-  }
-
-  for (const msg of job.conversation) {
-    const div = document.createElement('div');
-    div.className = 'conv-message conv-' + msg.role;
-
-    const roleLabel = document.createElement('div');
-    roleLabel.className = 'conv-role';
-    roleLabel.textContent = msg.role;
-    div.appendChild(roleLabel);
-
-    const body = document.createElement('div');
-    body.className = 'conv-body';
-    if (msg.role === 'assistant') {
-      body.innerHTML = renderMarkdown(msg.content);
-    } else {
-      body.textContent = msg.content;
-    }
-    div.appendChild(body);
-
-    // Tool calls on assistant messages
-    if (msg.tool_calls && msg.tool_calls.length > 0) {
-      const tcBlock = document.createElement('div');
-      tcBlock.className = 'conv-tool-calls';
-      for (const tc of msg.tool_calls) {
-        const tcEntry = document.createElement('div');
-        tcEntry.className = 'conv-tc-entry';
-        tcEntry.innerHTML = '<span class="conv-tc-name">' + escapeHtml(tc.name) + '</span>'
-          + '<pre class="conv-tc-args">' + escapeHtml(JSON.stringify(tc.arguments, null, 2)) + '</pre>';
-        tcBlock.appendChild(tcEntry);
-      }
-      div.appendChild(tcBlock);
-    }
-
-    // Tool call id on tool messages
-    if (msg.tool_call_id) {
-      const tcId = document.createElement('div');
-      tcId.className = 'conv-tc-id';
-      tcId.textContent = (msg.name || 'tool') + ' result';
-      div.insertBefore(tcId, div.firstChild.nextSibling);
-    }
-
-    container.appendChild(div);
-  }
-}
-
 function renderJobFiles(container, job) {
   container.innerHTML = '<div class="job-files">'
     + '<div class="job-files-sidebar"><div class="job-files-tree"></div></div>'
     + '<div class="job-files-viewer"><div class="empty-state">Select a file to view</div></div>'
     + '</div>';
 
-  // For sandbox jobs with a project_dir, use the project files API.
-  // For direct jobs, fall back to workspace memory API.
-  const isSandbox = job && job.source === 'sandbox' && job.project_dir;
-  const listUrl = isSandbox
-    ? '/api/jobs/' + job.id + '/files/list?path='
-    : '/api/memory/list?path=';
+  container._jobId = job ? job.id : null;
 
-  // Stash the current job context so tree expand/read can use the right API.
-  container._jobFilesContext = { isSandbox, jobId: job ? job.id : null };
-
-  apiFetch(listUrl).then((data) => {
+  apiFetch('/api/jobs/' + job.id + '/files/list?path=').then((data) => {
     jobFilesTreeState = data.entries.map((e) => ({
       name: e.name,
       path: e.path,
@@ -1576,9 +1451,9 @@ function renderJobFileNodes(nodes, container, depth) {
   }
 }
 
-function getJobFilesContext() {
+function getJobId() {
   const container = document.querySelector('.job-detail-content');
-  return (container && container._jobFilesContext) || { isSandbox: false, jobId: null };
+  return (container && container._jobId) || null;
 }
 
 function toggleJobFileExpand(node) {
@@ -1592,12 +1467,8 @@ function toggleJobFileExpand(node) {
     renderJobFilesTree();
     return;
   }
-  const ctx = getJobFilesContext();
-  const listUrl = ctx.isSandbox
-    ? '/api/jobs/' + ctx.jobId + '/files/list?path=' + encodeURIComponent(node.path)
-    : '/api/memory/list?path=' + encodeURIComponent(node.path);
-
-  apiFetch(listUrl).then((data) => {
+  const jobId = getJobId();
+  apiFetch('/api/jobs/' + jobId + '/files/list?path=' + encodeURIComponent(node.path)).then((data) => {
     node.children = data.entries.map((e) => ({
       name: e.name,
       path: e.path,
@@ -1615,12 +1486,8 @@ function toggleJobFileExpand(node) {
 function readJobFile(path) {
   const viewer = document.querySelector('.job-files-viewer');
   if (!viewer) return;
-  const ctx = getJobFilesContext();
-  const readUrl = ctx.isSandbox
-    ? '/api/jobs/' + ctx.jobId + '/files/read?path=' + encodeURIComponent(path)
-    : '/api/memory/read?path=' + encodeURIComponent(path);
-
-  apiFetch(readUrl).then((data) => {
+  const jobId = getJobId();
+  apiFetch('/api/jobs/' + jobId + '/files/read?path=' + encodeURIComponent(path)).then((data) => {
     viewer.innerHTML = '<div class="job-files-path">' + escapeHtml(path) + '</div>'
       + '<pre class="job-files-content">' + escapeHtml(data.content) + '</pre>';
   }).catch((err) => {

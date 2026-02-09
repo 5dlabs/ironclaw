@@ -454,7 +454,6 @@ mod tests {
             msg_tx: tokio::sync::RwLock::new(msg_tx),
             sse: SseManager::new(),
             workspace: None,
-            context_manager: None,
             session_manager: None,
             log_broadcaster: None,
             extension_manager: None,

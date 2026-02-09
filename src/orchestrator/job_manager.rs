@@ -361,7 +361,7 @@ impl ContainerJobManager {
     }
 
     /// Mark a job as complete with a result. The container is stopped but the
-    /// handle is kept so `RunInSandboxTool` can read the completion message.
+    /// handle is kept so `CreateJobTool` can read the completion message.
     pub async fn complete_job(
         &self,
         job_id: Uuid,
