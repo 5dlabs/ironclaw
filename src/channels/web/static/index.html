@@ -26,6 +26,7 @@
       <button data-tab="memory">Memory</button>
       <button data-tab="jobs">Jobs</button>
       <button data-tab="logs">Logs</button>
+      <button data-tab="routines">Routines</button>
       <button data-tab="extensions">Extensions</button>
       <div class="spacer"></div>
       <div class="status" id="gateway-status-trigger">
@@ -121,6 +122,32 @@
           <button onclick="clearLogs()">Clear</button>
         </div>
         <div class="logs-output" id="logs-output"></div>
+      </div>
+    </div>
+
+    <!-- Routines Tab -->
+    <div class="tab-panel" id="tab-routines">
+      <div class="routines-container">
+        <div class="routines-summary" id="routines-summary"></div>
+        <table class="routines-table" id="routines-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Trigger</th>
+              <th>Action</th>
+              <th>Last Run</th>
+              <th>Next Run</th>
+              <th>Runs</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="routines-tbody"></tbody>
+        </table>
+        <div class="empty-state" id="routines-empty" style="display:none">
+          No routines configured. Ask the assistant to create one.
+        </div>
+        <div class="routine-detail" id="routine-detail" style="display:none"></div>
       </div>
     </div>
 

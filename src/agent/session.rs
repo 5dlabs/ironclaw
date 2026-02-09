@@ -192,6 +192,22 @@ impl Thread {
         }
     }
 
+    /// Create a thread with a specific ID (for DB hydration).
+    pub fn with_id(id: Uuid, session_id: Uuid) -> Self {
+        let now = Utc::now();
+        Self {
+            id,
+            session_id,
+            state: ThreadState::Idle,
+            turns: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            metadata: serde_json::Value::Null,
+            pending_approval: None,
+            pending_auth: None,
+        }
+    }
+
     /// Get the current turn number (1-indexed for display).
     pub fn turn_number(&self) -> usize {
         self.turns.len() + 1
@@ -592,5 +608,38 @@ mod tests {
         let json = json.replace(",\"pending_auth\":null", "");
         let restored: Thread = serde_json::from_str(&json).expect("should deserialize");
         assert!(restored.pending_auth.is_none());
+    }
+
+    #[test]
+    fn test_thread_with_id() {
+        let specific_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let thread = Thread::with_id(specific_id, session_id);
+
+        assert_eq!(thread.id, specific_id);
+        assert_eq!(thread.session_id, session_id);
+        assert_eq!(thread.state, ThreadState::Idle);
+        assert!(thread.turns.is_empty());
+    }
+
+    #[test]
+    fn test_thread_with_id_restore_messages() {
+        let thread_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let mut thread = Thread::with_id(thread_id, session_id);
+
+        let messages = vec![
+            ChatMessage::user("Hello from DB"),
+            ChatMessage::assistant("Restored response"),
+        ];
+        thread.restore_from_messages(messages);
+
+        assert_eq!(thread.id, thread_id);
+        assert_eq!(thread.turns.len(), 1);
+        assert_eq!(thread.turns[0].user_input, "Hello from DB");
+        assert_eq!(
+            thread.turns[0].response,
+            Some("Restored response".to_string())
+        );
     }
 }

@@ -110,6 +110,41 @@ impl SessionManager {
         (session, thread_id)
     }
 
+    /// Register a hydrated thread so subsequent `resolve_thread` calls find it.
+    ///
+    /// Inserts into the thread_map and creates an undo manager for the thread.
+    pub async fn register_thread(
+        &self,
+        user_id: &str,
+        channel: &str,
+        thread_id: Uuid,
+        session: Arc<Mutex<Session>>,
+    ) {
+        let key = ThreadKey {
+            user_id: user_id.to_string(),
+            channel: channel.to_string(),
+            external_thread_id: Some(thread_id.to_string()),
+        };
+
+        {
+            let mut thread_map = self.thread_map.write().await;
+            thread_map.insert(key, thread_id);
+        }
+
+        {
+            let mut undo_managers = self.undo_managers.write().await;
+            undo_managers
+                .entry(thread_id)
+                .or_insert_with(|| Arc::new(Mutex::new(UndoManager::new())));
+        }
+
+        // Ensure the session is tracked
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.entry(user_id.to_string()).or_insert(session);
+        }
+    }
+
     /// Get undo manager for a thread.
     pub async fn get_undo_manager(&self, thread_id: Uuid) -> Arc<Mutex<UndoManager>> {
         // Fast path
@@ -295,5 +330,37 @@ mod tests {
             .prune_stale_sessions(std::time::Duration::from_secs(86400 * 365))
             .await;
         assert_eq!(pruned, 0);
+    }
+
+    #[tokio::test]
+    async fn test_register_thread() {
+        use crate::agent::session::{Session, Thread};
+
+        let manager = SessionManager::new();
+        let thread_id = Uuid::new_v4();
+
+        // Create a session with a hydrated thread
+        let session = Arc::new(Mutex::new(Session::new("user-hydrate")));
+        {
+            let mut sess = session.lock().await;
+            let thread = Thread::with_id(thread_id, sess.id);
+            sess.threads.insert(thread_id, thread);
+            sess.active_thread = Some(thread_id);
+        }
+
+        // Register the thread
+        manager
+            .register_thread("user-hydrate", "gateway", thread_id, Arc::clone(&session))
+            .await;
+
+        // resolve_thread should find it (using the UUID as external_thread_id)
+        let (resolved_session, resolved_tid) = manager
+            .resolve_thread("user-hydrate", "gateway", Some(&thread_id.to_string()))
+            .await;
+        assert_eq!(resolved_tid, thread_id);
+
+        // Should be the same session object
+        let sess = resolved_session.lock().await;
+        assert!(sess.threads.contains_key(&thread_id));
     }
 }

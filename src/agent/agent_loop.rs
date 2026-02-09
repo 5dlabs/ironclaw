@@ -462,6 +462,11 @@ impl Agent {
         // Parse submission type first
         let submission = SubmissionParser::parse(&message.content);
 
+        // Hydrate thread from DB if it's a historical thread not in memory
+        if let Some(ref external_thread_id) = message.thread_id {
+            self.maybe_hydrate_thread(message, external_thread_id).await;
+        }
+
         // Resolve session and thread
         let (session, thread_id) = self
             .session_manager
@@ -585,6 +590,83 @@ impl Agent {
                 Ok(Some(String::new()))
             }
         }
+    }
+
+    /// Hydrate a historical thread from DB into memory if not already present.
+    ///
+    /// Called before `resolve_thread` so that the session manager finds the
+    /// thread on lookup instead of creating a new one.
+    async fn maybe_hydrate_thread(&self, message: &IncomingMessage, external_thread_id: &str) {
+        // Only hydrate UUID-shaped thread IDs (web gateway uses UUIDs)
+        let thread_uuid = match Uuid::parse_str(external_thread_id) {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+
+        // Check if already in memory
+        let session = self
+            .session_manager
+            .get_or_create_session(&message.user_id)
+            .await;
+        {
+            let sess = session.lock().await;
+            if sess.threads.contains_key(&thread_uuid) {
+                return;
+            }
+        }
+
+        // Try to load from DB
+        let store = match self.store() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let db_messages = match store.list_conversation_messages(thread_uuid).await {
+            Ok(msgs) if !msgs.is_empty() => msgs,
+            _ => return,
+        };
+
+        // Build ChatMessage list from DB messages
+        let chat_messages: Vec<ChatMessage> = db_messages
+            .iter()
+            .filter_map(|m| match m.role.as_str() {
+                "user" => Some(ChatMessage::user(&m.content)),
+                "assistant" => Some(ChatMessage::assistant(&m.content)),
+                _ => None,
+            })
+            .collect();
+
+        // Create thread with the historical ID and restore messages
+        let session_id = {
+            let sess = session.lock().await;
+            sess.id
+        };
+
+        let mut thread = crate::agent::session::Thread::with_id(thread_uuid, session_id);
+        thread.restore_from_messages(chat_messages);
+
+        // Insert into session and register with session manager
+        {
+            let mut sess = session.lock().await;
+            sess.threads.insert(thread_uuid, thread);
+            sess.active_thread = Some(thread_uuid);
+            sess.last_active_at = chrono::Utc::now();
+        }
+
+        self.session_manager
+            .register_thread(
+                &message.user_id,
+                &message.channel,
+                thread_uuid,
+                Arc::clone(&session),
+            )
+            .await;
+
+        tracing::debug!(
+            "Hydrated thread {} from DB ({} messages)",
+            thread_uuid,
+            db_messages.len()
+        );
     }
 
     async fn process_user_input(
@@ -774,6 +856,10 @@ impl Agent {
                         &message.metadata,
                     )
                     .await;
+
+                // Fire-and-forget: persist turn to DB
+                self.persist_turn(thread_id, &message.user_id, content, Some(&response));
+
                 Ok(SubmissionResult::response(response))
             }
             Ok(AgenticLoopResult::NeedApproval { pending }) => {
@@ -800,9 +886,58 @@ impl Agent {
             }
             Err(e) => {
                 thread.fail_turn(e.to_string());
+
+                // Persist the user message even on failure
+                self.persist_turn(thread_id, &message.user_id, content, None);
+
                 Ok(SubmissionResult::error(e.to_string()))
             }
         }
+    }
+
+    /// Fire-and-forget: persist a turn (user message + optional assistant response) to the DB.
+    fn persist_turn(
+        &self,
+        thread_id: Uuid,
+        user_id: &str,
+        user_input: &str,
+        response: Option<&str>,
+    ) {
+        let store = match self.store() {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+
+        let user_id = user_id.to_string();
+        let user_input = user_input.to_string();
+        let response = response.map(String::from);
+
+        tokio::spawn(async move {
+            if let Err(e) = store
+                .ensure_conversation(thread_id, "gateway", &user_id, None)
+                .await
+            {
+                tracing::warn!("Failed to ensure conversation {}: {}", thread_id, e);
+                return;
+            }
+
+            if let Err(e) = store
+                .add_conversation_message(thread_id, "user", &user_input)
+                .await
+            {
+                tracing::warn!("Failed to persist user message: {}", e);
+                return;
+            }
+
+            if let Some(ref resp) = response {
+                if let Err(e) = store
+                    .add_conversation_message(thread_id, "assistant", resp)
+                    .await
+                {
+                    tracing::warn!("Failed to persist assistant message: {}", e);
+                }
+            }
+        });
     }
 
     /// Run the agentic loop: call LLM, execute tools, repeat until text response.

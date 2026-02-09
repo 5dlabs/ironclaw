@@ -142,6 +142,17 @@ pub async fn start_server(
             "/api/extensions/{name}/remove",
             post(extensions_remove_handler),
         )
+        // Routines
+        .route("/api/routines", get(routines_list_handler))
+        .route("/api/routines/summary", get(routines_summary_handler))
+        .route("/api/routines/{id}", get(routines_detail_handler))
+        .route("/api/routines/{id}/trigger", post(routines_trigger_handler))
+        .route("/api/routines/{id}/toggle", post(routines_toggle_handler))
+        .route(
+            "/api/routines/{id}",
+            axum::routing::delete(routines_delete_handler),
+        )
+        .route("/api/routines/{id}/runs", get(routines_runs_handler))
         // Gateway control plane
         .route("/api/gateway/status", get(gateway_status_handler))
         .route_layer(middleware::from_fn_with_state(auth_state, auth_middleware));
@@ -429,34 +440,90 @@ async fn chat_history_handler(
             .ok_or((StatusCode::NOT_FOUND, "No active thread".to_string()))?
     };
 
-    let thread = sess
-        .threads
-        .get(&thread_id)
-        .ok_or((StatusCode::NOT_FOUND, "Thread not found".to_string()))?;
-
-    let turns: Vec<TurnInfo> = thread
-        .turns
-        .iter()
-        .map(|t| TurnInfo {
-            turn_number: t.turn_number,
-            user_input: t.user_input.clone(),
-            response: t.response.clone(),
-            state: format!("{:?}", t.state),
-            started_at: t.started_at.to_rfc3339(),
-            completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
-            tool_calls: t
-                .tool_calls
+    // Try in-memory first (freshest data for active threads)
+    if let Some(thread) = sess.threads.get(&thread_id) {
+        if !thread.turns.is_empty() {
+            let turns: Vec<TurnInfo> = thread
+                .turns
                 .iter()
-                .map(|tc| ToolCallInfo {
-                    name: tc.name.clone(),
-                    has_result: tc.result.is_some(),
-                    has_error: tc.error.is_some(),
+                .map(|t| TurnInfo {
+                    turn_number: t.turn_number,
+                    user_input: t.user_input.clone(),
+                    response: t.response.clone(),
+                    state: format!("{:?}", t.state),
+                    started_at: t.started_at.to_rfc3339(),
+                    completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
+                    tool_calls: t
+                        .tool_calls
+                        .iter()
+                        .map(|tc| ToolCallInfo {
+                            name: tc.name.clone(),
+                            has_result: tc.result.is_some(),
+                            has_error: tc.error.is_some(),
+                        })
+                        .collect(),
                 })
-                .collect(),
-        })
-        .collect();
+                .collect();
 
-    Ok(Json(HistoryResponse { thread_id, turns }))
+            return Ok(Json(HistoryResponse { thread_id, turns }));
+        }
+    }
+
+    // Fall back to DB for historical threads not in memory
+    if let Some(ref store) = state.store {
+        if let Ok(messages) = store.list_conversation_messages(thread_id).await {
+            if !messages.is_empty() {
+                let turns = build_turns_from_db_messages(&messages);
+                return Ok(Json(HistoryResponse { thread_id, turns }));
+            }
+        }
+    }
+
+    // Empty thread (just created, no messages yet)
+    Ok(Json(HistoryResponse {
+        thread_id,
+        turns: Vec::new(),
+    }))
+}
+
+/// Build TurnInfo pairs from flat DB messages (alternating user/assistant).
+fn build_turns_from_db_messages(messages: &[crate::history::ConversationMessage]) -> Vec<TurnInfo> {
+    let mut turns = Vec::new();
+    let mut turn_number = 0;
+    let mut iter = messages.iter().peekable();
+
+    while let Some(msg) = iter.next() {
+        if msg.role == "user" {
+            let mut turn = TurnInfo {
+                turn_number,
+                user_input: msg.content.clone(),
+                response: None,
+                state: "Completed".to_string(),
+                started_at: msg.created_at.to_rfc3339(),
+                completed_at: None,
+                tool_calls: Vec::new(),
+            };
+
+            // Check if next message is an assistant response
+            if let Some(next) = iter.peek() {
+                if next.role == "assistant" {
+                    let assistant_msg = iter.next().expect("peeked");
+                    turn.response = Some(assistant_msg.content.clone());
+                    turn.completed_at = Some(assistant_msg.created_at.to_rfc3339());
+                }
+            }
+
+            // Incomplete turn (user message without response)
+            if turn.response.is_none() {
+                turn.state = "Failed".to_string();
+            }
+
+            turns.push(turn);
+            turn_number += 1;
+        }
+    }
+
+    turns
 }
 
 async fn chat_threads_handler(
@@ -470,6 +537,34 @@ async fn chat_threads_handler(
     let session = session_manager.get_or_create_session(&state.user_id).await;
     let sess = session.lock().await;
 
+    // Try DB first for persistent thread list
+    if let Some(ref store) = state.store {
+        if let Ok(summaries) = store
+            .list_conversations_with_preview(&state.user_id, "gateway", 50)
+            .await
+        {
+            if !summaries.is_empty() {
+                let threads: Vec<ThreadInfo> = summaries
+                    .iter()
+                    .map(|s| ThreadInfo {
+                        id: s.id,
+                        state: "Idle".to_string(),
+                        turn_count: (s.message_count / 2).max(0) as usize,
+                        created_at: s.started_at.to_rfc3339(),
+                        updated_at: s.last_activity.to_rfc3339(),
+                        title: s.title.clone(),
+                    })
+                    .collect();
+
+                return Ok(Json(ThreadListResponse {
+                    threads,
+                    active_thread: sess.active_thread,
+                }));
+            }
+        }
+    }
+
+    // Fallback: in-memory only
     let threads: Vec<ThreadInfo> = sess
         .threads
         .values()
@@ -479,6 +574,7 @@ async fn chat_threads_handler(
             turn_count: t.turns.len(),
             created_at: t.created_at.to_rfc3339(),
             updated_at: t.updated_at.to_rfc3339(),
+            title: None,
         })
         .collect();
 
@@ -499,14 +595,31 @@ async fn chat_new_thread_handler(
     let session = session_manager.get_or_create_session(&state.user_id).await;
     let mut sess = session.lock().await;
     let thread = sess.create_thread();
-
-    Ok(Json(ThreadInfo {
+    let thread_id = thread.id;
+    let info = ThreadInfo {
         id: thread.id,
         state: format!("{:?}", thread.state),
         turn_count: thread.turns.len(),
         created_at: thread.created_at.to_rfc3339(),
         updated_at: thread.updated_at.to_rfc3339(),
-    }))
+        title: None,
+    };
+
+    // Persist the empty conversation row so it shows up in thread list
+    if let Some(ref store) = state.store {
+        let store = Arc::clone(store);
+        let user_id = state.user_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = store
+                .ensure_conversation(thread_id, "gateway", &user_id, None)
+                .await
+            {
+                tracing::warn!("Failed to persist new thread: {}", e);
+            }
+        });
+    }
+
+    Ok(Json(info))
 }
 
 // --- Memory handlers ---
@@ -1350,6 +1463,323 @@ async fn extensions_remove_handler(
     }
 }
 
+// --- Routines handlers ---
+
+async fn routines_list_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<RoutineListResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let routines = store
+        .list_routines(&state.user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let items: Vec<RoutineInfo> = routines.iter().map(routine_to_info).collect();
+
+    Ok(Json(RoutineListResponse { routines: items }))
+}
+
+async fn routines_summary_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<RoutineSummaryResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let routines = store
+        .list_routines(&state.user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let total = routines.len() as u64;
+    let enabled = routines.iter().filter(|r| r.enabled).count() as u64;
+    let disabled = total - enabled;
+    let failing = routines
+        .iter()
+        .filter(|r| r.consecutive_failures > 0)
+        .count() as u64;
+
+    let today_start = chrono::Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .map(|dt| dt.and_utc());
+    let runs_today = if let Some(start) = today_start {
+        routines
+            .iter()
+            .filter(|r| r.last_run_at.is_some_and(|ts| ts >= start))
+            .count() as u64
+    } else {
+        0
+    };
+
+    Ok(Json(RoutineSummaryResponse {
+        total,
+        enabled,
+        disabled,
+        failing,
+        runs_today,
+    }))
+}
+
+async fn routines_detail_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<RoutineDetailResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let routine_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
+
+    let routine = store
+        .get_routine(routine_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+
+    let runs = store
+        .list_routine_runs(routine_id, 20)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let recent_runs: Vec<RoutineRunInfo> = runs
+        .iter()
+        .map(|run| RoutineRunInfo {
+            id: run.id,
+            trigger_type: run.trigger_type.clone(),
+            started_at: run.started_at.to_rfc3339(),
+            completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
+            status: format!("{:?}", run.status),
+            result_summary: run.result_summary.clone(),
+            tokens_used: run.tokens_used,
+        })
+        .collect();
+
+    Ok(Json(RoutineDetailResponse {
+        id: routine.id,
+        name: routine.name.clone(),
+        description: routine.description.clone(),
+        enabled: routine.enabled,
+        trigger: serde_json::to_value(&routine.trigger).unwrap_or_default(),
+        action: serde_json::to_value(&routine.action).unwrap_or_default(),
+        guardrails: serde_json::to_value(&routine.guardrails).unwrap_or_default(),
+        notify: serde_json::to_value(&routine.notify).unwrap_or_default(),
+        last_run_at: routine.last_run_at.map(|dt| dt.to_rfc3339()),
+        next_fire_at: routine.next_fire_at.map(|dt| dt.to_rfc3339()),
+        run_count: routine.run_count,
+        consecutive_failures: routine.consecutive_failures,
+        created_at: routine.created_at.to_rfc3339(),
+        recent_runs,
+    }))
+}
+
+async fn routines_trigger_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let routine_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
+
+    let routine = store
+        .get_routine(routine_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+
+    // Send the routine prompt through the message pipeline as a manual trigger.
+    let prompt = match &routine.action {
+        crate::agent::routine::RoutineAction::Lightweight { prompt, .. } => prompt.clone(),
+        crate::agent::routine::RoutineAction::FullJob {
+            title, description, ..
+        } => format!("{}: {}", title, description),
+    };
+
+    let content = format!("[routine:{}] {}", routine.name, prompt);
+    let msg = IncomingMessage::new("gateway", &state.user_id, content);
+
+    let tx_guard = state.msg_tx.read().await;
+    let tx = tx_guard.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Channel not started".to_string(),
+    ))?;
+
+    tx.send(msg).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Channel closed".to_string(),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "status": "triggered",
+        "routine_id": routine_id,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ToggleRequest {
+    enabled: Option<bool>,
+}
+
+async fn routines_toggle_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    body: Option<Json<ToggleRequest>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let routine_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
+
+    let mut routine = store
+        .get_routine(routine_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+
+    // If a specific value was provided, use it; otherwise toggle.
+    routine.enabled = match body {
+        Some(Json(req)) => req.enabled.unwrap_or(!routine.enabled),
+        None => !routine.enabled,
+    };
+
+    store
+        .update_routine(&routine)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": if routine.enabled { "enabled" } else { "disabled" },
+        "routine_id": routine_id,
+    })))
+}
+
+async fn routines_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let routine_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
+
+    let deleted = store
+        .delete_routine(routine_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if deleted {
+        Ok(Json(serde_json::json!({
+            "status": "deleted",
+            "routine_id": routine_id,
+        })))
+    } else {
+        Err((StatusCode::NOT_FOUND, "Routine not found".to_string()))
+    }
+}
+
+async fn routines_runs_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let routine_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
+
+    let runs = store
+        .list_routine_runs(routine_id, 50)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let run_infos: Vec<RoutineRunInfo> = runs
+        .iter()
+        .map(|run| RoutineRunInfo {
+            id: run.id,
+            trigger_type: run.trigger_type.clone(),
+            started_at: run.started_at.to_rfc3339(),
+            completed_at: run.completed_at.map(|dt| dt.to_rfc3339()),
+            status: format!("{:?}", run.status),
+            result_summary: run.result_summary.clone(),
+            tokens_used: run.tokens_used,
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "routine_id": routine_id,
+        "runs": run_infos,
+    })))
+}
+
+/// Convert a Routine to the trimmed RoutineInfo for list display.
+fn routine_to_info(r: &crate::agent::routine::Routine) -> RoutineInfo {
+    let (trigger_type, trigger_summary) = match &r.trigger {
+        crate::agent::routine::Trigger::Cron { schedule } => {
+            ("cron".to_string(), format!("cron: {}", schedule))
+        }
+        crate::agent::routine::Trigger::Event {
+            pattern, channel, ..
+        } => {
+            let ch = channel.as_deref().unwrap_or("any");
+            ("event".to_string(), format!("on {} /{}/", ch, pattern))
+        }
+        crate::agent::routine::Trigger::Webhook { path, .. } => {
+            let p = path.as_deref().unwrap_or("/");
+            ("webhook".to_string(), format!("webhook: {}", p))
+        }
+        crate::agent::routine::Trigger::Manual => ("manual".to_string(), "manual only".to_string()),
+    };
+
+    let action_type = match &r.action {
+        crate::agent::routine::RoutineAction::Lightweight { .. } => "lightweight",
+        crate::agent::routine::RoutineAction::FullJob { .. } => "full_job",
+    };
+
+    let status = if !r.enabled {
+        "disabled"
+    } else if r.consecutive_failures > 0 {
+        "failing"
+    } else {
+        "active"
+    };
+
+    RoutineInfo {
+        id: r.id,
+        name: r.name.clone(),
+        description: r.description.clone(),
+        enabled: r.enabled,
+        trigger_type,
+        trigger_summary,
+        action_type: action_type.to_string(),
+        last_run_at: r.last_run_at.map(|dt| dt.to_rfc3339()),
+        next_fire_at: r.next_fire_at.map(|dt| dt.to_rfc3339()),
+        run_count: r.run_count,
+        consecutive_failures: r.consecutive_failures,
+        status: status.to_string(),
+    }
+}
+
 // --- Gateway control plane handlers ---
 
 async fn gateway_status_handler(
@@ -1374,4 +1804,85 @@ struct GatewayStatusResponse {
     sse_connections: u64,
     ws_connections: u64,
     total_connections: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_turns_from_db_messages_complete() {
+        let now = chrono::Utc::now();
+        let messages = vec![
+            crate::history::ConversationMessage {
+                id: Uuid::new_v4(),
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+                created_at: now,
+            },
+            crate::history::ConversationMessage {
+                id: Uuid::new_v4(),
+                role: "assistant".to_string(),
+                content: "Hi there!".to_string(),
+                created_at: now + chrono::TimeDelta::seconds(1),
+            },
+            crate::history::ConversationMessage {
+                id: Uuid::new_v4(),
+                role: "user".to_string(),
+                content: "How are you?".to_string(),
+                created_at: now + chrono::TimeDelta::seconds(2),
+            },
+            crate::history::ConversationMessage {
+                id: Uuid::new_v4(),
+                role: "assistant".to_string(),
+                content: "Doing well!".to_string(),
+                created_at: now + chrono::TimeDelta::seconds(3),
+            },
+        ];
+
+        let turns = build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].user_input, "Hello");
+        assert_eq!(turns[0].response.as_deref(), Some("Hi there!"));
+        assert_eq!(turns[0].state, "Completed");
+        assert_eq!(turns[1].user_input, "How are you?");
+        assert_eq!(turns[1].response.as_deref(), Some("Doing well!"));
+    }
+
+    #[test]
+    fn test_build_turns_from_db_messages_incomplete_last() {
+        let now = chrono::Utc::now();
+        let messages = vec![
+            crate::history::ConversationMessage {
+                id: Uuid::new_v4(),
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+                created_at: now,
+            },
+            crate::history::ConversationMessage {
+                id: Uuid::new_v4(),
+                role: "assistant".to_string(),
+                content: "Hi!".to_string(),
+                created_at: now + chrono::TimeDelta::seconds(1),
+            },
+            crate::history::ConversationMessage {
+                id: Uuid::new_v4(),
+                role: "user".to_string(),
+                content: "Lost message".to_string(),
+                created_at: now + chrono::TimeDelta::seconds(2),
+            },
+        ];
+
+        let turns = build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].user_input, "Lost message");
+        assert!(turns[1].response.is_none());
+        assert_eq!(turns[1].state, "Failed");
+    }
+
+    #[test]
+    fn test_build_turns_from_db_messages_empty() {
+        let turns = build_turns_from_db_messages(&[]);
+        assert!(turns.is_empty());
+    }
 }

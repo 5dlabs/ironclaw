@@ -1097,6 +1097,125 @@ fn row_to_routine_run(row: &tokio_postgres::Row) -> Result<RoutineRun, DatabaseE
     })
 }
 
+// ==================== Conversation Persistence ====================
+
+/// Summary of a conversation for the thread list.
+#[derive(Debug, Clone)]
+pub struct ConversationSummary {
+    pub id: Uuid,
+    /// First user message, truncated to 100 chars.
+    pub title: Option<String>,
+    pub message_count: i64,
+    pub started_at: DateTime<Utc>,
+    pub last_activity: DateTime<Utc>,
+}
+
+/// A single message in a conversation.
+#[derive(Debug, Clone)]
+pub struct ConversationMessage {
+    pub id: Uuid,
+    pub role: String,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Store {
+    /// Ensure a conversation row exists for a given UUID.
+    ///
+    /// Idempotent: inserts on first call, bumps `last_activity` on subsequent calls.
+    pub async fn ensure_conversation(
+        &self,
+        id: Uuid,
+        channel: &str,
+        user_id: &str,
+        thread_id: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn().await?;
+        conn.execute(
+            r#"
+            INSERT INTO conversations (id, channel, user_id, thread_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (id) DO UPDATE SET last_activity = NOW()
+            "#,
+            &[&id, &channel, &user_id, &thread_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// List conversations with a title derived from the first user message.
+    pub async fn list_conversations_with_preview(
+        &self,
+        user_id: &str,
+        channel: &str,
+        limit: i64,
+    ) -> Result<Vec<ConversationSummary>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT
+                    c.id,
+                    c.started_at,
+                    c.last_activity,
+                    (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id) AS message_count,
+                    (SELECT LEFT(m2.content, 100)
+                     FROM conversation_messages m2
+                     WHERE m2.conversation_id = c.id AND m2.role = 'user'
+                     ORDER BY m2.created_at ASC
+                     LIMIT 1
+                    ) AS title
+                FROM conversations c
+                WHERE c.user_id = $1 AND c.channel = $2
+                ORDER BY c.last_activity DESC
+                LIMIT $3
+                "#,
+                &[&user_id, &channel, &limit],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| ConversationSummary {
+                id: r.get("id"),
+                title: r.get("title"),
+                message_count: r.get("message_count"),
+                started_at: r.get("started_at"),
+                last_activity: r.get("last_activity"),
+            })
+            .collect())
+    }
+
+    /// Load all messages for a conversation, ordered chronologically.
+    pub async fn list_conversation_messages(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Vec<ConversationMessage>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, role, content, created_at
+                FROM conversation_messages
+                WHERE conversation_id = $1
+                ORDER BY created_at ASC
+                "#,
+                &[&conversation_id],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| ConversationMessage {
+                id: r.get("id"),
+                role: r.get("role"),
+                content: r.get("content"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+}
+
 fn parse_job_state(s: &str) -> JobState {
     match s {
         "pending" => JobState::Pending,
