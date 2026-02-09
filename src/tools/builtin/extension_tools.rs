@@ -185,8 +185,9 @@ impl Tool for ToolAuthTool {
     }
 
     fn description(&self) -> &str {
-        "Authenticate an installed extension. For MCP servers, starts OAuth flow. \
-         For WASM tools with manual auth, returns instructions; call again with token param to complete."
+        "Initiate authentication for an extension. For OAuth, returns a URL. \
+         For manual auth, returns instructions. The user provides their token \
+         through a secure channel, never through this tool."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -196,10 +197,6 @@ impl Tool for ToolAuthTool {
                 "name": {
                     "type": "string",
                     "description": "Extension name to authenticate"
-                },
-                "token": {
-                    "type": "string",
-                    "description": "API token/key for manual auth (WASM tools). Provide after user gives you the token."
                 }
             },
             "required": ["name"]
@@ -218,11 +215,9 @@ impl Tool for ToolAuthTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParameters("name is required".to_string()))?;
 
-        let token = params.get("token").and_then(|v| v.as_str());
-
         let result = self
             .manager
-            .auth(name, token)
+            .auth(name, None)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -499,7 +494,11 @@ mod tests {
         assert!(tool.requires_approval());
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("name").is_some());
-        assert!(schema["properties"].get("token").is_some());
+        // token param must NOT be in schema (security: tokens never go through LLM)
+        assert!(
+            schema["properties"].get("token").is_none(),
+            "tool_auth must not have a token parameter"
+        );
     }
 
     #[test]

@@ -885,10 +885,26 @@ impl Agent {
                         if let Some((ext_name, instructions)) =
                             detect_auth_awaiting(&tc.name, &tool_result)
                         {
-                            let mut sess = session.lock().await;
-                            if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                                thread.enter_auth_mode(ext_name);
+                            let auth_data = parse_auth_result(&tool_result);
+                            {
+                                let mut sess = session.lock().await;
+                                if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                                    thread.enter_auth_mode(ext_name.clone());
+                                }
                             }
+                            let _ = self
+                                .channels
+                                .send_status(
+                                    &message.channel,
+                                    StatusUpdate::AuthRequired {
+                                        extension_name: ext_name,
+                                        instructions: Some(instructions.clone()),
+                                        auth_url: auth_data.auth_url,
+                                        setup_url: auth_data.setup_url,
+                                    },
+                                    &message.metadata,
+                                )
+                                .await;
                             return Ok(AgenticLoopResult::Response(instructions));
                         }
 
@@ -1267,10 +1283,11 @@ impl Agent {
             if let Some((ext_name, instructions)) =
                 detect_auth_awaiting(&pending.tool_name, &tool_result)
             {
+                let auth_data = parse_auth_result(&tool_result);
                 {
                     let mut sess = session.lock().await;
                     if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                        thread.enter_auth_mode(ext_name);
+                        thread.enter_auth_mode(ext_name.clone());
                         thread.complete_turn(&instructions);
                     }
                 }
@@ -1278,7 +1295,12 @@ impl Agent {
                     .channels
                     .send_status(
                         &message.channel,
-                        StatusUpdate::Status("Awaiting token".into()),
+                        StatusUpdate::AuthRequired {
+                            extension_name: ext_name,
+                            instructions: Some(instructions.clone()),
+                            auth_url: auth_data.auth_url,
+                            setup_url: auth_data.setup_url,
+                        },
                         &message.metadata,
                     )
                     .await;
@@ -1419,16 +1441,6 @@ impl Agent {
                     pending.extension_name
                 );
 
-                // Notify via channel status so the response doesn't echo the token
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::Status("Authenticated, loading tools...".into()),
-                        &message.metadata,
-                    )
-                    .await;
-
                 // Auto-activate so tools are available immediately after auth
                 match ext_mgr.activate(&pending.extension_name).await {
                     Ok(activate_result) => {
@@ -1438,10 +1450,23 @@ impl Agent {
                         } else {
                             format!("\n\nTools: {}", activate_result.tools_loaded.join(", "))
                         };
-                        Ok(Some(format!(
+                        let msg = format!(
                             "{} authenticated and activated ({} tools loaded).{}",
                             pending.extension_name, tool_count, tool_list
-                        )))
+                        );
+                        let _ = self
+                            .channels
+                            .send_status(
+                                &message.channel,
+                                StatusUpdate::AuthCompleted {
+                                    extension_name: pending.extension_name.clone(),
+                                    success: true,
+                                    message: msg.clone(),
+                                },
+                                &message.metadata,
+                            )
+                            .await;
+                        Ok(Some(msg))
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1449,16 +1474,29 @@ impl Agent {
                             pending.extension_name,
                             e
                         );
-                        Ok(Some(format!(
+                        let msg = format!(
                             "{} authenticated successfully, but activation failed: {}. \
                              Try activating manually.",
                             pending.extension_name, e
-                        )))
+                        );
+                        let _ = self
+                            .channels
+                            .send_status(
+                                &message.channel,
+                                StatusUpdate::AuthCompleted {
+                                    extension_name: pending.extension_name.clone(),
+                                    success: true,
+                                    message: msg.clone(),
+                                },
+                                &message.metadata,
+                            )
+                            .await;
+                        Ok(Some(msg))
                     }
                 }
             }
             Ok(result) => {
-                // Unexpected state, re-enter auth mode
+                // Invalid token, re-enter auth mode
                 {
                     let mut sess = session.lock().await;
                     if let Some(thread) = sess.threads.get_mut(&thread_id) {
@@ -1467,13 +1505,43 @@ impl Agent {
                 }
                 let msg = result
                     .instructions
+                    .clone()
                     .unwrap_or_else(|| "Invalid token. Please try again.".to_string());
+                // Re-emit AuthRequired so web UI re-shows the card
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::AuthRequired {
+                            extension_name: pending.extension_name.clone(),
+                            instructions: Some(msg.clone()),
+                            auth_url: result.auth_url,
+                            setup_url: result.setup_url,
+                        },
+                        &message.metadata,
+                    )
+                    .await;
                 Ok(Some(msg))
             }
-            Err(e) => Ok(Some(format!(
-                "Authentication failed for {}: {}",
-                pending.extension_name, e
-            ))),
+            Err(e) => {
+                let msg = format!(
+                    "Authentication failed for {}: {}",
+                    pending.extension_name, e
+                );
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::AuthCompleted {
+                            extension_name: pending.extension_name.clone(),
+                            success: false,
+                            message: msg.clone(),
+                        },
+                        &message.metadata,
+                    )
+                    .await;
+                Ok(Some(msg))
+            }
         }
     }
 
@@ -1954,6 +2022,32 @@ impl Agent {
             SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
             _ => Ok(None),
         }
+    }
+}
+
+/// Parsed auth result fields for emitting StatusUpdate::AuthRequired.
+struct ParsedAuthData {
+    auth_url: Option<String>,
+    setup_url: Option<String>,
+}
+
+/// Extract auth_url and setup_url from a tool_auth result JSON string.
+fn parse_auth_result(result: &Result<String, Error>) -> ParsedAuthData {
+    let parsed = result
+        .as_ref()
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    ParsedAuthData {
+        auth_url: parsed
+            .as_ref()
+            .and_then(|v| v.get("auth_url"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        setup_url: parsed
+            .as_ref()
+            .and_then(|v| v.get("setup_url"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     }
 }
 

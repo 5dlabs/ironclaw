@@ -96,6 +96,8 @@ pub async fn start_server(
         // Chat
         .route("/api/chat/send", post(chat_send_handler))
         .route("/api/chat/approval", post(chat_approval_handler))
+        .route("/api/chat/auth-token", post(chat_auth_token_handler))
+        .route("/api/chat/auth-cancel", post(chat_auth_cancel_handler))
         .route("/api/chat/events", get(chat_events_handler))
         .route("/api/chat/ws", get(chat_ws_handler))
         .route("/api/chat/history", get(chat_history_handler))
@@ -294,6 +296,85 @@ async fn chat_approval_handler(
             status: "accepted",
         }),
     ))
+}
+
+/// Submit an auth token directly to the extension manager, bypassing the message pipeline.
+///
+/// The token never touches the LLM, chat history, or SSE stream.
+async fn chat_auth_token_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<AuthTokenRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let ext_mgr = state.extension_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Extension manager not available".to_string(),
+    ))?;
+
+    let result = ext_mgr
+        .auth(&req.extension_name, Some(&req.token))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if result.status == "authenticated" {
+        // Auto-activate so tools are available immediately
+        let msg = match ext_mgr.activate(&req.extension_name).await {
+            Ok(r) => format!(
+                "{} authenticated ({} tools loaded)",
+                req.extension_name,
+                r.tools_loaded.len()
+            ),
+            Err(e) => format!(
+                "{} authenticated but activation failed: {}",
+                req.extension_name, e
+            ),
+        };
+
+        // Clear auth mode on the active thread
+        clear_auth_mode(&state).await;
+
+        state.sse.broadcast(SseEvent::AuthCompleted {
+            extension_name: req.extension_name,
+            success: true,
+            message: msg.clone(),
+        });
+
+        Ok(Json(ActionResponse::ok(msg)))
+    } else {
+        // Re-emit auth_required for retry
+        state.sse.broadcast(SseEvent::AuthRequired {
+            extension_name: req.extension_name.clone(),
+            instructions: result.instructions.clone(),
+            auth_url: result.auth_url.clone(),
+            setup_url: result.setup_url.clone(),
+        });
+        Ok(Json(ActionResponse::fail(
+            result
+                .instructions
+                .unwrap_or_else(|| "Invalid token".to_string()),
+        )))
+    }
+}
+
+/// Cancel an in-progress auth flow.
+async fn chat_auth_cancel_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(_req): Json<AuthCancelRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    clear_auth_mode(&state).await;
+    Ok(Json(ActionResponse::ok("Auth cancelled")))
+}
+
+/// Clear pending auth mode on the active thread.
+pub async fn clear_auth_mode(state: &GatewayState) {
+    if let Some(ref sm) = state.session_manager {
+        let session = sm.get_or_create_session(&state.user_id).await;
+        let mut sess = session.lock().await;
+        if let Some(thread_id) = sess.active_thread {
+            if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                thread.pending_auth = None;
+            }
+        }
+    }
 }
 
 async fn chat_events_handler(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {

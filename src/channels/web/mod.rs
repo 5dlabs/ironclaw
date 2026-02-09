@@ -249,6 +249,26 @@ impl Channel for GatewayChannel {
                 parameters: serde_json::to_string_pretty(&parameters)
                     .unwrap_or_else(|_| parameters.to_string()),
             },
+            StatusUpdate::AuthRequired {
+                extension_name,
+                instructions,
+                auth_url,
+                setup_url,
+            } => SseEvent::AuthRequired {
+                extension_name,
+                instructions,
+                auth_url,
+                setup_url,
+            },
+            StatusUpdate::AuthCompleted {
+                extension_name,
+                success,
+                message,
+            } => SseEvent::AuthCompleted {
+                extension_name,
+                success,
+                message,
+            },
         };
 
         self.state.sse.broadcast(event);

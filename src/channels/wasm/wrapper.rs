@@ -1858,6 +1858,24 @@ fn status_to_wit(status: &StatusUpdate, metadata: &serde_json::Value) -> wit_cha
             message: format!("Job started: {} ({})", title, job_id),
             metadata_json,
         },
+        StatusUpdate::AuthRequired { extension_name, .. } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Thinking,
+            message: format!("Auth required: {}", extension_name),
+            metadata_json,
+        },
+        StatusUpdate::AuthCompleted {
+            extension_name,
+            success,
+            ..
+        } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Thinking,
+            message: format!(
+                "Auth {}: {}",
+                if *success { "completed" } else { "failed" },
+                extension_name
+            ),
+            metadata_json,
+        },
     }
 }
 

@@ -220,6 +220,62 @@ async fn handle_client_message(
                 let _ = tx.send(msg).await;
             }
         }
+        WsClientMessage::AuthToken {
+            extension_name,
+            token,
+        } => {
+            if let Some(ref ext_mgr) = state.extension_manager {
+                match ext_mgr.auth(&extension_name, Some(&token)).await {
+                    Ok(result) if result.status == "authenticated" => {
+                        let msg = match ext_mgr.activate(&extension_name).await {
+                            Ok(r) => format!(
+                                "{} authenticated ({} tools loaded)",
+                                extension_name,
+                                r.tools_loaded.len()
+                            ),
+                            Err(e) => format!(
+                                "{} authenticated but activation failed: {}",
+                                extension_name, e
+                            ),
+                        };
+                        crate::channels::web::server::clear_auth_mode(state).await;
+                        state
+                            .sse
+                            .broadcast(crate::channels::web::types::SseEvent::AuthCompleted {
+                                extension_name,
+                                success: true,
+                                message: msg,
+                            });
+                    }
+                    Ok(result) => {
+                        state
+                            .sse
+                            .broadcast(crate::channels::web::types::SseEvent::AuthRequired {
+                                extension_name,
+                                instructions: result.instructions,
+                                auth_url: result.auth_url,
+                                setup_url: result.setup_url,
+                            });
+                    }
+                    Err(e) => {
+                        let _ = direct_tx
+                            .send(WsServerMessage::Error {
+                                message: format!("Auth failed: {}", e),
+                            })
+                            .await;
+                    }
+                }
+            } else {
+                let _ = direct_tx
+                    .send(WsServerMessage::Error {
+                        message: "Extension manager not available".to_string(),
+                    })
+                    .await;
+            }
+        }
+        WsClientMessage::AuthCancel { .. } => {
+            crate::channels::web::server::clear_auth_mode(state).await;
+        }
         WsClientMessage::Ping => {
             let _ = direct_tx.send(WsServerMessage::Pong).await;
         }

@@ -125,6 +125,19 @@ pub enum StatusUpdate {
         description: String,
         parameters: serde_json::Value,
     },
+    /// Extension needs user authentication (token or OAuth).
+    AuthRequired {
+        extension_name: String,
+        instructions: Option<String>,
+        auth_url: Option<String>,
+        setup_url: Option<String>,
+    },
+    /// Extension authentication completed.
+    AuthCompleted {
+        extension_name: String,
+        success: bool,
+        message: String,
+    },
 }
 
 /// Trait for message channels.

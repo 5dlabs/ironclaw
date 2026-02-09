@@ -78,6 +78,8 @@ impl SseManager {
                     SseEvent::StreamChunk { .. } => "stream_chunk",
                     SseEvent::Status { .. } => "status",
                     SseEvent::ApprovalNeeded { .. } => "approval_needed",
+                    SseEvent::AuthRequired { .. } => "auth_required",
+                    SseEvent::AuthCompleted { .. } => "auth_completed",
                     SseEvent::Error { .. } => "error",
                     SseEvent::JobStarted { .. } => "job_started",
                     SseEvent::Heartbeat => "heartbeat",

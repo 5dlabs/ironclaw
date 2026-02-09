@@ -95,6 +95,22 @@ pub enum SseEvent {
         description: String,
         parameters: String,
     },
+    #[serde(rename = "auth_required")]
+    AuthRequired {
+        extension_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auth_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        setup_url: Option<String>,
+    },
+    #[serde(rename = "auth_completed")]
+    AuthCompleted {
+        extension_name: String,
+        success: bool,
+        message: String,
+    },
     #[serde(rename = "error")]
     Error { message: String },
     #[serde(rename = "heartbeat")]
@@ -352,6 +368,21 @@ impl ActionResponse {
     }
 }
 
+// --- Auth Token ---
+
+/// Request to submit an auth token for an extension (dedicated endpoint).
+#[derive(Debug, Deserialize)]
+pub struct AuthTokenRequest {
+    pub extension_name: String,
+    pub token: String,
+}
+
+/// Request to cancel an in-progress auth flow.
+#[derive(Debug, Deserialize)]
+pub struct AuthCancelRequest {
+    pub extension_name: String,
+}
+
 // --- WebSocket ---
 
 /// Message sent by a WebSocket client to the server.
@@ -371,6 +402,15 @@ pub enum WsClientMessage {
         /// "approve", "always", or "deny"
         action: String,
     },
+    /// Submit an auth token for an extension (bypasses message pipeline).
+    #[serde(rename = "auth_token")]
+    AuthToken {
+        extension_name: String,
+        token: String,
+    },
+    /// Cancel an in-progress auth flow.
+    #[serde(rename = "auth_cancel")]
+    AuthCancel { extension_name: String },
     /// Client heartbeat ping.
     #[serde(rename = "ping")]
     Ping,
@@ -408,6 +448,8 @@ impl WsServerMessage {
             SseEvent::Status { .. } => "status",
             SseEvent::JobStarted { .. } => "job_started",
             SseEvent::ApprovalNeeded { .. } => "approval_needed",
+            SseEvent::AuthRequired { .. } => "auth_required",
+            SseEvent::AuthCompleted { .. } => "auth_completed",
             SseEvent::Error { .. } => "error",
             SseEvent::Heartbeat => "heartbeat",
         };
@@ -566,5 +608,116 @@ mod tests {
             }
             _ => panic!("Expected Event variant"),
         }
+    }
+
+    // ---- Auth type tests ----
+
+    #[test]
+    fn test_ws_client_auth_token_parse() {
+        let json = r#"{"type":"auth_token","extension_name":"notion","token":"sk-123"}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::AuthToken {
+                extension_name,
+                token,
+            } => {
+                assert_eq!(extension_name, "notion");
+                assert_eq!(token, "sk-123");
+            }
+            _ => panic!("Expected AuthToken variant"),
+        }
+    }
+
+    #[test]
+    fn test_ws_client_auth_cancel_parse() {
+        let json = r#"{"type":"auth_cancel","extension_name":"notion"}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            WsClientMessage::AuthCancel { extension_name } => {
+                assert_eq!(extension_name, "notion");
+            }
+            _ => panic!("Expected AuthCancel variant"),
+        }
+    }
+
+    #[test]
+    fn test_sse_auth_required_serialize() {
+        let event = SseEvent::AuthRequired {
+            extension_name: "notion".to_string(),
+            instructions: Some("Get your token from...".to_string()),
+            auth_url: None,
+            setup_url: Some("https://notion.so/integrations".to_string()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "auth_required");
+        assert_eq!(parsed["extension_name"], "notion");
+        assert_eq!(parsed["instructions"], "Get your token from...");
+        assert!(parsed.get("auth_url").is_none());
+        assert_eq!(parsed["setup_url"], "https://notion.so/integrations");
+    }
+
+    #[test]
+    fn test_sse_auth_completed_serialize() {
+        let event = SseEvent::AuthCompleted {
+            extension_name: "notion".to_string(),
+            success: true,
+            message: "notion authenticated (3 tools loaded)".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "auth_completed");
+        assert_eq!(parsed["extension_name"], "notion");
+        assert_eq!(parsed["success"], true);
+    }
+
+    #[test]
+    fn test_ws_server_from_sse_auth_required() {
+        let sse = SseEvent::AuthRequired {
+            extension_name: "openai".to_string(),
+            instructions: Some("Enter API key".to_string()),
+            auth_url: None,
+            setup_url: None,
+        };
+        let ws = WsServerMessage::from_sse_event(&sse);
+        match ws {
+            WsServerMessage::Event { event_type, data } => {
+                assert_eq!(event_type, "auth_required");
+                assert_eq!(data["extension_name"], "openai");
+            }
+            _ => panic!("Expected Event variant"),
+        }
+    }
+
+    #[test]
+    fn test_ws_server_from_sse_auth_completed() {
+        let sse = SseEvent::AuthCompleted {
+            extension_name: "slack".to_string(),
+            success: false,
+            message: "Invalid token".to_string(),
+        };
+        let ws = WsServerMessage::from_sse_event(&sse);
+        match ws {
+            WsServerMessage::Event { event_type, data } => {
+                assert_eq!(event_type, "auth_completed");
+                assert_eq!(data["success"], false);
+            }
+            _ => panic!("Expected Event variant"),
+        }
+    }
+
+    #[test]
+    fn test_auth_token_request_deserialize() {
+        let json = r#"{"extension_name":"telegram","token":"bot12345"}"#;
+        let req: AuthTokenRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.extension_name, "telegram");
+        assert_eq!(req.token, "bot12345");
+    }
+
+    #[test]
+    fn test_auth_cancel_request_deserialize() {
+        let json = r#"{"extension_name":"telegram"}"#;
+        let req: AuthCancelRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.extension_name, "telegram");
     }
 }

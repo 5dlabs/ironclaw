@@ -391,6 +391,109 @@ body {
   font-style: italic;
 }
 
+/* Auth card (inline in chat) */
+.auth-card {
+  align-self: flex-start;
+  max-width: 80%;
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin: 8px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.auth-card .auth-header {
+  font-weight: 600;
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.auth-card .auth-instructions {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.4;
+}
+
+.auth-card .auth-links {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.auth-card .auth-links a {
+  color: var(--accent);
+  font-size: 13px;
+  text-decoration: underline;
+}
+
+.auth-card .auth-token-input {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.auth-card .auth-token-input input {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  font-family: monospace;
+}
+
+.auth-card .auth-token-input input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.auth-card .auth-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.auth-card .auth-actions button {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 13px;
+  background: var(--bg-secondary);
+  color: var(--text);
+}
+
+.auth-card .auth-actions button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.auth-card .auth-actions button.auth-submit {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.auth-card .auth-actions button.auth-cancel {
+  background: var(--bg-secondary);
+  border-color: var(--border);
+}
+
+.auth-card .auth-actions button.auth-oauth {
+  background: var(--success);
+  border-color: var(--success);
+  color: #fff;
+}
+
+.auth-card .auth-error {
+  color: var(--danger);
+  font-size: 12px;
+}
+
 /* Chat input */
 .chat-input {
   display: flex;
