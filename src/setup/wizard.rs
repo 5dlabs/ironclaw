@@ -689,6 +689,9 @@ impl SetupWizard {
                     } else if channel_name == "telegram" {
                         let telegram_result =
                             setup_telegram(ctx).await.map_err(SetupError::Channel)?;
+                        if let Some(owner_id) = telegram_result.owner_id {
+                            self.settings.channels.telegram_owner_id = Some(owner_id);
+                        }
                         crate::setup::channels::WasmChannelSetupResult {
                             enabled: telegram_result.enabled,
                             channel_name: "telegram".to_string(),

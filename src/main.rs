@@ -724,6 +724,18 @@ async fn main() -> anyhow::Result<()> {
                                     );
                                 }
 
+                                // Inject owner_id for Telegram so the bot only responds
+                                // to the bound user account.
+                                if channel_name == "telegram" {
+                                    let settings = ironclaw::settings::Settings::load();
+                                    if let Some(owner_id) = settings.channels.telegram_owner_id {
+                                        config_updates.insert(
+                                            "owner_id".to_string(),
+                                            serde_json::json!(owner_id),
+                                        );
+                                    }
+                                }
+
                                 if !config_updates.is_empty() {
                                     channel_arc.update_config(config_updates).await;
                                     tracing::info!(

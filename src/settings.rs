@@ -149,6 +149,11 @@ pub struct ChannelSettings {
     #[serde(default)]
     pub http_host: Option<String>,
 
+    /// Telegram owner user ID. When set, the bot only responds to this user.
+    /// Captured during setup by having the user message the bot.
+    #[serde(default)]
+    pub telegram_owner_id: Option<i64>,
+
     /// Enabled WASM channels by name.
     /// Channels not in this list but present in the channels directory will still load.
     /// This is primarily used by the setup wizard to track which channels were configured.
@@ -798,5 +803,33 @@ mod tests {
         assert!(!settings.embeddings.enabled);
         assert_eq!(settings.embeddings.provider, "nearai");
         assert_eq!(settings.embeddings.model, "text-embedding-3-small");
+    }
+
+    #[test]
+    fn test_telegram_owner_id_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let mut settings = Settings::default();
+        settings.channels.telegram_owner_id = Some(123456789);
+        settings.save_to(&path).unwrap();
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.channels.telegram_owner_id, Some(123456789));
+    }
+
+    #[test]
+    fn test_telegram_owner_id_default_none() {
+        let settings = Settings::default();
+        assert_eq!(settings.channels.telegram_owner_id, None);
+    }
+
+    #[test]
+    fn test_telegram_owner_id_via_set() {
+        let mut settings = Settings::default();
+        settings
+            .set("channels.telegram_owner_id", "987654321")
+            .unwrap();
+        assert_eq!(settings.channels.telegram_owner_id, Some(987654321));
     }
 }
